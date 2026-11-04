@@ -103,6 +103,19 @@ function avatar(ch, size = '') {
   return av;
 }
 
+// Baú de bônus: mostra se o app está pegando agora, se está na fila ou esperando a próxima tentativa.
+function chestButton(ch) {
+  const auto = !!state.autoChest;
+  const label = ch.chestState === 'claiming' ? '🎁 pegando…' : ch.chestState === 'queued' ? '🎁 na fila' : '🎁';
+  const c = el('button', 'chest-mini' + (ch.chestState ? ` ${ch.chestState}` : ''), label);
+  c.title = !auto ? 'Baú de bônus: clique para abrir o chat e pegar +50'
+    : ch.chestState === 'claiming' ? 'O app está pegando este baú agora'
+    : ch.chestState === 'queued' ? 'Na fila: o app pega um baú de cada vez'
+    : 'Baú de bônus: o app vai pegar sozinho em instantes. Clique para abrir o chat e pegar agora.';
+  c.onclick = (e) => { e.stopPropagation(); window.tt.openStore(ch.slug); };
+  return c;
+}
+
 function channelCard(ch) {
   const favs = new Set(state.favorites || []);
   const queued = ch.live && !ch.watching;
@@ -122,12 +135,7 @@ function channelCard(ch) {
   else sub.append(el('span', 'off', ch.rewardsLoaded && !ch.hasBonus ? 'bônus em breve' : 'offline'));
   info.append(name, sub);
   const side = el('div', 'ch-side');
-  if (ch.chest) {
-    const c = el('button', 'chest-mini', '🎁');
-    c.title = 'Baú de bônus: clique para abrir o chat e pegar +50';
-    c.onclick = (e) => { e.stopPropagation(); window.tt.openStore(ch.slug); };
-    side.append(c);
-  }
+  if (ch.chest) side.append(chestButton(ch));
   if (ch.points != null) side.append(el('span', 'ch-pts', fmt(ch.points)));
   card.append(avatar(ch), info, side);
   const goalLine = ch.hasBonus && ch.goalLeft != null ? `\nFaltam ${fmt(ch.goalLeft)} pts para ${fmt(ch.goal)}` : '';
@@ -321,12 +329,7 @@ function renderPanel() {
     const tdName = el('td', null, ch.displayName);
     if (ch.following) { const f = el('span', 'follow', '♥'); f.title = 'Você segue este canal'; tdName.append(' ', f); }
     if (ch.subscribed) tdName.append(' ', subBadge(ch.multiplier));
-    if (ch.chest) {
-      const c = el('button', 'chest-mini', '🎁');
-      c.title = 'Baú de bônus disponível: clique para abrir o chat e pegar';
-      c.onclick = (e) => { e.stopPropagation(); window.tt.openStore(ch.slug); };
-      tdName.append(' ', c);
-    }
+    if (ch.chest) tdName.append(' ', chestButton(ch));
     if (ch.rewardsLoaded && !ch.hasBonus) { const s = el('span', 'soon', 'em breve'); s.title = 'Este canal ainda não tem as recompensas do PokeIdle'; tdName.append(' ', s); }
     tr.append(tdName, tdStatus, tdPts, el('td', null, `${ch.watchedMin} min`));
     tr.style.cursor = 'pointer';
@@ -552,7 +555,7 @@ function showIntro(kind) {
   } else {
     wrap.append(el('h3', null, `Novidades da versão ${state.version} ✨`));
     const ul = el('ul');
-    for (const n of ['Melhorias e correções.']) ul.append(el('li', null, n));
+    for (const n of ['🎁 Baú de +50 mais rápido: o app pega um de cada vez, logo depois do login, e mostra "pegando…" enquanto trabalha.', '📈 O contador de baús de hoje aparece no topo.']) ul.append(el('li', null, n));
     wrap.append(ul);
   }
   const actions = el('div', 'modal-actions');

@@ -512,7 +512,7 @@ async function refreshAll() {
   // Baú de bônus: com "Pegar baú sozinho" o app clica nele; sem isso, um aviso só para todos os
   // canais, no máximo a cada 15 min, e a pessoa abre e clica.
   if (config.autoChest && loggedIn) {
-    for (const slug of config.channels) if ((status.get(slug) || {}).claim) claimChest(slug);
+    for (const slug of config.channels) if ((status.get(slug) || {}).claim) queueChest(slug);
   } else if (fresh.length && config.notifyChest && Date.now() - chestNotifiedAt > 15 * 60 * 1000) {
     chestNotifiedAt = Date.now();
     const names = fresh.map((slug) => (status.get(slug) || {}).displayName || slug);
@@ -522,28 +522,78 @@ async function refreshAll() {
 
 // Pega o baú de bônus: abre o chat do canal numa janela escondida, espera o botão do baú
 // aparecer (o mesmo que você clicaria ao lado do saldo), clica uma vez e fecha. Não gasta pontos.
-const claiming = new Set();
+// Os baús vão numa fila, um de cada vez: várias janelas de chat abrindo juntas deixavam a página
+// lenta e o botão não aparecia a tempo. Cada tentativa fica em chest-log.jsonl (pasta de dados).
+const chestQueue = [];
+let chestBusy = null;
 const lastClaimTry = new Map();
+const CHEST_RETRY_MS = 90 * 1000;
+
+function queueChest(slug) {
+  if (chestBusy === slug || chestQueue.includes(slug) || Date.now() - (lastClaimTry.get(slug) || 0) < CHEST_RETRY_MS) return;
+  chestQueue.push(slug);
+  runChestQueue();
+}
+
+async function runChestQueue() {
+  if (chestBusy) return;
+  const slug = chestQueue.shift();
+  if (!slug) return;
+  chestBusy = slug;
+  send('status', snapshot());
+  try { await claimChest(slug); } catch {}
+  chestBusy = null;
+  send('status', snapshot());
+  runChestQueue();
+}
+
+function chestLog(entry) {
+  try {
+    const file = path.join(app.getPath('userData'), 'chest-log.jsonl');
+    if (fs.existsSync(file) && fs.statSync(file).size > 1024 * 1024) fs.renameSync(file, file + '.old');
+    fs.appendFileSync(file, JSON.stringify({ t: new Date().toISOString(), ...entry }) + '\n');
+  } catch {}
+}
+
+// Procura o botão do baú do jeito mais firme possível: o ícone do baú, ou um botão do resumo de
+// pontos com nome de "resgatar/claim". Devolve o que achou para o registro.
+const FIND_CHEST = `new Promise((done) => {
+  let n = 0;
+  const find = () => {
+    const icon = document.querySelector('.claimable-bonus__icon');
+    if (icon && icon.closest('button')) return icon.closest('button');
+    const box = document.querySelector('[data-test-selector="community-points-summary"]');
+    const buttons = [...(box || document).querySelectorAll('button')];
+    return buttons.find((b) => /claim bonus|resgatar b[oô]nus|coletar|claim/i.test(b.getAttribute('aria-label') || ''));
+  };
+  const t = setInterval(() => {
+    const btn = find();
+    if (btn) { clearInterval(t); btn.click(); return done({ ok: true, tries: n, label: btn.getAttribute('aria-label') || '' }); }
+    if (++n > 80) {
+      clearInterval(t);
+      const box = document.querySelector('[data-test-selector="community-points-summary"]');
+      done({ ok: false, tries: n, summary: !!box, labels: box ? [...box.querySelectorAll('button')].map((b) => b.getAttribute('aria-label') || '').slice(0, 5) : [], url: location.href });
+    }
+  }, 500);
+})`;
+
 async function claimChest(slug) {
-  if (claiming.has(slug) || Date.now() - (lastClaimTry.get(slug) || 0) < 2 * 60 * 1000) return;
-  claiming.add(slug);
   lastClaimTry.set(slug, Date.now());
+  const started = Date.now();
   const win = new BrowserWindow({
-    width: 400, height: 640, show: false, skipTaskbar: true, focusable: false,
+    width: 400, height: 640, x: 0, y: 0, show: false, skipTaskbar: true, focusable: false, type: 'toolbar', opacity: 0,
     webPreferences: { partition: PARTITION, backgroundThrottling: false, spellcheck: false },
   });
   win.webContents.setAudioMuted(true);
+  // Como as lives ocultas: a janela existe na tela (transparente e sem cliques), para a página
+  // da Twitch se comportar como uma aba aberta.
+  win.setIgnoreMouseEvents(true);
+  if (!isLinux) win.showInactive();
+  let result = { ok: false };
   try {
-    await withTimeout(win.loadURL(`${TWITCH}/popout/${slug}/chat?popout=`), 30 * 1000);
-    const ok = await withTimeout(win.webContents.executeJavaScript(`new Promise((done) => {
-      let n = 0;
-      const t = setInterval(() => {
-        const icon = document.querySelector('.claimable-bonus__icon');
-        const btn = icon && icon.closest('button');
-        if (btn) { clearInterval(t); btn.click(); done(true); } else if (++n > 40) { clearInterval(t); done(false); }
-      }, 750);
-    })`), 40 * 1000);
-    if (ok) {
+    await withTimeout(win.loadURL(`${TWITCH}/popout/${slug}/chat?popout=`), 45 * 1000);
+    result = await withTimeout(win.webContents.executeJavaScript(FIND_CHEST), 50 * 1000);
+    if (result.ok) {
       await new Promise((r) => setTimeout(r, 3000)); // deixa a Twitch confirmar antes de fechar
       const s = status.get(slug) || {};
       s.claim = null;
@@ -554,10 +604,13 @@ async function claimChest(slug) {
       configDirty = true;
       send('toast', `🎁 Baú pego em ${s.displayName || slug}: +50 pts`);
     }
-  } catch {} finally {
+  } catch (e) {
+    result = { ok: false, error: String(e.message || e) };
+  } finally {
     if (!win.isDestroyed()) win.destroy();
-    claiming.delete(slug);
   }
+  chestLog({ slug, ms: Date.now() - started, ...result });
+  return result.ok;
 }
 
 // ---------- Chat (IRC da Twitch, só leitura sem login; envio com a sua conta) ----------
@@ -1014,7 +1067,7 @@ function snapshot() {
         watching: watchers.has(slug), ageGate: !!s.ageGate, earning: earningState(slug, now),
         following: s.following ?? null, subscribed: !!s.subscribed, multiplier: s.multiplier || 1,
         gained: s.gainedTotal || 0, goal: rank ? rank.goal : null, goalLeft: rank ? rank.left : null,
-        costs: costsOf(s), hasBonus: hasBonus(s), rewardsLoaded: !!s.rewards, chest: !!s.claim,
+        costs: costsOf(s), hasBonus: hasBonus(s), rewardsLoaded: !!s.rewards, chest: !!s.claim, chestState: chestBusy === slug ? 'claiming' : chestQueue.includes(slug) ? 'queued' : null,
         rewards: (s.rewards || []).filter((r) => r.available).map((r) => ({ kind: r.kind, hours: r.hours, cost: r.cost })),
         priceChange: s.priceChange && now - s.priceChange.at < DAY_MS ? s.priceChange.text : null,
         pointsEnabled: s.pointsEnabled !== false,

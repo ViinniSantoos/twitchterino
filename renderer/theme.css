@@ -257,3 +257,6 @@ button.group:hover { color: var(--text); background: none; box-shadow: none; }
   .brand-name, .switch-text { display: none; }
 }
 .stat.gold b { color: var(--gold); }
+.chest-mini.claiming { animation: chest-spin 1s ease-in-out infinite; background: linear-gradient(135deg, #7dffb3, #3ee6ff); }
+.chest-mini.queued { opacity: .75; animation: none; }
+@keyframes chest-spin { 50% { transform: scale(1.08); box-shadow: 0 0 14px rgba(125, 255, 179, .8); } }
