@@ -1,0 +1,1299 @@
+// Twitchterino — processo principal.
+// Ideia: uma sessão de navegador persistente (você faz login na Twitch uma vez), uma janela
+// oculta "api" em twitch.tv para consultar canais, pontos e recompensas, e uma janela oculta e
+// muda por canal AO VIVO tocando o player real — é isso que conta como "assistindo".
+// Uma conta por vez: o app nunca abre lives com mais de uma conta.
+const {
+  app, BrowserWindow, dialog, ipcMain, session, Tray, Menu, Notification, nativeImage, powerSaveBlocker, powerMonitor, net,
+} = require('electron');
+const { autoUpdater } = require('electron-updater');
+const path = require('path');
+const fs = require('fs');
+
+// Mantém vídeos rodando mesmo com janelas ocultas/minimizadas.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('disable-background-media-suspend');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,BackgroundVideoTrackOptimization,IntensiveWakeUpThrottling');
+app.commandLine.appendSwitch('js-flags', '--max-semi-space-size=1');
+
+// Pasta de dados alternativa (testes sem mexer na instalação de verdade).
+if (process.env.TWITCHTERINO_DATA) app.setPath('userData', process.env.TWITCHTERINO_DATA);
+
+// A Twitch recusa login de navegadores que ela não conhece: o app se apresenta como o Chrome que ele é.
+app.userAgentFallback = app.userAgentFallback.replace(/ (Electron|twitchterino|Twitchterino)\/\S+/g, '');
+
+const PARTITION = 'persist:twitch';
+const TWITCH = 'https://www.twitch.tv';
+const GQL = 'https://gql.twitch.tv/gql';
+const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko'; // o mesmo do site da Twitch
+const POLL_MS = 60 * 1000;
+const PLAYER_CHECK_MS = 30 * 1000;
+const LOGIN_RE = /^[a-z0-9_]{2,25}$/;
+
+const configPath = () => path.join(app.getPath('userData'), 'config.json');
+const DEFAULT_CONFIG = {
+  // Canais oficiais do PokeIdle na Twitch (lista do jogo em 04/11/2026).
+  channels: [
+    'clovaobengala', 'dersin2k', 'mecmeno', 'guaxilol1', 'denissnidertv', 'faturetosl', 'patopapao', 'axtlol',
+    'matta', 'rodil', 'biscoitao', 'cogu', 'tftoddy', 'luccatv', 'techzz', 'revolta', 'yetz',
+  ],
+  farming: true,
+  // A Twitch conta no máximo 2 lives por IP como espectador: mais que isso é testado à parte.
+  maxWatchers: 2,
+  lowQuality: true,
+  rotation: true,
+  bonusTarget: '', // '' = automático; ou 'xp', 'capture', 'lure'
+  notifyBonus: true,
+  autoChest: true,   // baú de bônus da Twitch: o app clica nele sozinho (pode desligar)
+  notifyChest: true, // sem o automático: avisa e a pessoa clica
+  notifyChat: true,
+  sleepMode: false,
+  favorites: [],
+  purchases: [], // { t, kind, hours, slug, cost }
+  daily: {},
+};
+let config = { ...DEFAULT_CONFIG };
+let firstRun = false;
+
+function loadConfig() {
+  firstRun = !fs.existsSync(configPath());
+  try { config = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(configPath(), 'utf8')) }; } catch {}
+  const seen = new Set(config.seenDefaults || config.channels);
+  for (const slug of DEFAULT_CONFIG.channels) {
+    if (!seen.has(slug) && !config.channels.includes(slug)) config.channels.push(slug);
+  }
+  config.seenDefaults = [...new Set([...seen, ...DEFAULT_CONFIG.channels])];
+  saveConfig();
+}
+function saveConfig() {
+  fs.writeFileSync(configPath(), JSON.stringify(config, null, 2));
+}
+
+let mainWin = null;
+let apiWin = null;
+let apiReady = null;
+const watchers = new Map(); // slug -> BrowserWindow
+const status = new Map();   // slug -> estado do canal
+
+function send(channel, payload) {
+  if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(channel, payload);
+}
+
+// Anúncios e rastreadores de terceiros: não fazem parte da live e só gastam memória/CPU.
+const BLOCKED_HOSTS = [
+  'googlesyndication.com', 'doubleclick.net', 'googletagmanager.com', 'google-analytics.com',
+  'googleadservices.com', 'adservice.google.com', 'imasdk.googleapis.com', 'amazon-adsystem.com',
+  'facebook.net', 'facebook.com/tr', 'quora.com', 'analytics.tiktok.com', 'criteo.com', 'criteo.net',
+  'adnxs.com', 'rubiconproject.com', 'pubmatic.com', 'taboola.com', 'hotjar.com', 'clarity.ms', 'scorecardresearch.com',
+];
+
+const watcherIds = new Set();
+const HIDDEN_SKIP = new Set(['image', 'font']);
+function isHiddenWatcher(webContents) {
+  if (!webContents || !watcherIds.has(webContents.id)) return false;
+  const win = BrowserWindow.fromWebContents(webContents);
+  return !!win && !userOpened.has(win);
+}
+
+const ALLOWED_PERMISSIONS = new Set(['fullscreen', 'clipboard-sanitized-write']);
+
+function setupSession() {
+  const ses = session.fromPartition(PARTITION);
+  ses.setSpellCheckerEnabled(false);
+  ses.setUserAgent(app.userAgentFallback);
+  ses.setPermissionRequestHandler((_wc, permission, cb) => cb(ALLOWED_PERMISSIONS.has(permission)));
+  ses.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, cb) => {
+    cb({ cancel: BLOCKED_HOSTS.some((h) => details.url.includes(h)) || (HIDDEN_SKIP.has(details.resourceType) && isHiddenWatcher(details.webContents)) });
+  });
+  // Login feito: a janela de login some sozinha e o app já começa.
+  ses.cookies.on('changed', (_e, cookie, _cause, removed) => {
+    if (cookie.name !== 'auth-token' || removed) return;
+    setTimeout(() => {
+      if (apiWin && !apiWin.isDestroyed() && apiWin.isVisible()) { apiWin.hide(); loadApi(LIGHT_URL).then(poll); }
+    }, 2500);
+  });
+}
+
+// Deixa só a menor qualidade de vídeo (160p) na lista de qualidades da live — o mesmo que
+// escolher 160p no player. Na lista da Twitch cada qualidade tem sua linha #EXT-X-MEDIA, que fica.
+function lowestQualityOnly(playlist) {
+  const lines = playlist.split('\n');
+  const keep = [];
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXT-X-STREAM-INF')) { variants.push([lines[i], lines[i + 1]]); i++; } else keep.push(lines[i]);
+  }
+  const video = variants.filter(([inf]) => /RESOLUTION=/.test(inf) && !/audio_only/i.test(inf));
+  if (video.length < 2) return null;
+  const bandwidth = (l) => Number((l.match(/BANDWIDTH=(\d+)/) || [0, Infinity])[1]);
+  video.sort((a, b) => bandwidth(a[0]) - bandwidth(b[0]));
+  return [...keep.filter((l) => l.trim()), ...video[0]].join('\n') + '\n';
+}
+
+// Só a Twitch e as páginas de login que ela oferece (Apple, Facebook, Amazon, Google) abrem no
+// app: nada de site de fora na mesma sessão que guarda o login.
+const TRUSTED_DOMAINS = ['twitch.tv', 'apple.com', 'facebook.com', 'amazon.com', 'google.com', 'accounts.youtube.com'];
+function isTrustedUrl(url) {
+  if (url === 'about:blank') return true;
+  try {
+    const { protocol, hostname } = new URL(url);
+    return protocol === 'https:' && TRUSTED_DOMAINS.some((d) => hostname === d || hostname.endsWith(`.${d}`));
+  } catch { return false; }
+}
+
+app.on('web-contents-created', (_e, wc) => {
+  wc.setWindowOpenHandler(({ url }) => (isTrustedUrl(url) ? {
+    action: 'allow',
+    overrideBrowserWindowOptions: { width: 520, height: 720, autoHideMenuBar: true, webPreferences: { partition: PARTITION } },
+  } : { action: 'deny' }));
+  const guard = (details) => { if (details.isMainFrame && !isTrustedUrl(details.url)) details.preventDefault(); };
+  wc.on('will-navigate', guard);
+  wc.on('will-redirect', guard);
+});
+
+// Página "vazia" em twitch.tv: mesma origem e cookies, sem carregar o site inteiro.
+const LIGHT_URL = `${TWITCH}/robots.txt`;
+
+const withTimeout = (promise, ms) => Promise.race([
+  promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+]);
+
+function loadApi(url) {
+  apiReady = new Promise((resolve) => apiWin.webContents.once('did-finish-load', resolve));
+  apiWin.loadURL(url);
+  return apiReady;
+}
+
+function createApiWindow() {
+  apiWin = new BrowserWindow({
+    width: 1000, height: 780, show: false, title: 'Twitch — login', autoHideMenuBar: true,
+    icon: path.join(__dirname, 'build', 'icon.png'),
+    webPreferences: { partition: PARTITION, backgroundThrottling: false },
+  });
+  apiWin.webContents.setAudioMuted(true);
+  const retryApi = () => setTimeout(() => { if (!apiWin.isVisible()) loadApi(LIGHT_URL); }, 30 * 1000);
+  apiWin.webContents.on('did-fail-load', (_e, code, _desc, _url, isMainFrame) => { if (isMainFrame && code !== -3) retryApi(); });
+  apiWin.webContents.on('render-process-gone', retryApi);
+  loadApi(LIGHT_URL);
+  apiWin.on('close', (e) => {
+    if (app.isQuitting) return;
+    e.preventDefault();
+    apiWin.hide();
+    loadApi(LIGHT_URL).then(poll);
+  });
+}
+
+async function cookie(name) {
+  const list = await session.fromPartition(PARTITION).cookies.get({ url: TWITCH, name });
+  return list[0] ? decodeURIComponent(list[0].value) : '';
+}
+const authToken = () => cookie('auth-token');
+
+// Consulta a API do site da Twitch (GraphQL) de dentro da página twitch.tv, como o próprio site faz.
+async function gql(query) {
+  await withTimeout(apiReady, 20 * 1000);
+  const token = await authToken();
+  const device = await cookie('unique_id');
+  const code = `(async () => {
+    const headers = { 'Client-Id': ${JSON.stringify(CLIENT_ID)}, 'Content-Type': 'text/plain;charset=UTF-8' };
+    const token = ${JSON.stringify(token)}, device = ${JSON.stringify(device)};
+    if (token) headers['Authorization'] = 'OAuth ' + token;
+    if (device) headers['X-Device-Id'] = device;
+    const r = await fetch(${JSON.stringify(GQL)}, { method: 'POST', headers, body: ${JSON.stringify(JSON.stringify({ query }))} });
+    return { status: r.status, text: await r.text() };
+  })()`;
+  const res = await withTimeout(apiWin.webContents.executeJavaScript(code, true), 20 * 1000);
+  let json = null;
+  try { json = JSON.parse(res.text); } catch {}
+  return { status: res.status, json };
+}
+
+// ---------- Recompensas do PokeIdle ----------
+// Cada canal define o preço e há versões de 1 h, 3 h, 5 h e 10 h. O app lê a loja de cada canal
+// em vez de usar preço fixo; sem recompensa ainda ("em breve"), vale o padrão do jogo.
+const KINDS = [
+  { kind: 'xp', name: '+15% XP', re: /\bXP\b/i, def: 300 },
+  { kind: 'capture', name: '+15% Capture Boost', re: /capture/i, def: 500 },
+  { kind: 'lure', name: '+15% Secret Lure', re: /secret\s*lure|\blure\b/i, def: 1000 },
+];
+const KIND = Object.fromEntries(KINDS.map((k) => [k.kind, k]));
+
+function parseRewards(list) {
+  const out = [];
+  for (const r of list || []) {
+    const title = String(r.title || '');
+    if (!/15\s*%|pokeidle|b[oô]nus/i.test(title)) continue;
+    const k = KINDS.find((x) => x.re.test(title));
+    if (!k) continue;
+    const hours = Number((title.match(/\((\d+)\s*h\)/i) || [0, 1])[1]) || 1;
+    out.push({ id: r.id, kind: k.kind, hours, cost: r.cost, title, available: !!r.isEnabled && !r.isPaused && r.isInStock !== false });
+  }
+  return out;
+}
+
+// Preço de 1 h de cada bônus no canal (padrão do jogo se o canal não tiver a recompensa).
+function costsOf(s) {
+  const costs = {};
+  for (const k of KINDS) {
+    const r = (s.rewards || []).filter((x) => x.kind === k.kind && x.available).sort((a, b) => a.hours - b.hours)[0];
+    costs[k.kind] = r ? Math.round(r.cost / r.hours) : k.def;
+  }
+  return costs;
+}
+const hasBonus = (s) => (s.rewards || []).some((r) => r.available);
+
+const BONUS_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const KEEP_PURCHASES_MS = 10 * DAY_MS;
+let configDirty = false;
+
+const liveNotifications = new Set();
+function notify(title, body, onClick) {
+  if (!Notification.isSupported()) return;
+  const n = new Notification({ title, body, icon: path.join(__dirname, 'build', 'icon.png') });
+  liveNotifications.add(n);
+  n.on('click', () => { liveNotifications.delete(n); if (onClick) onClick(); });
+  n.on('close', () => liveNotifications.delete(n));
+  n.show();
+}
+
+// Avisa quando o saldo alcança um bônus do canal (o saldo ao abrir o app é a referência).
+function checkBonus(slug, s) {
+  const costs = costsOf(s);
+  const reach = KINDS.filter((k) => s.points >= costs[k.kind]);
+  const tier = reach.length;
+  const wanted = !config.bonusTarget || reach.some((k) => k.kind === config.bonusTarget);
+  if (s.bonusTier != null && tier > s.bonusTier && config.notifyBonus && wanted && hasBonus(s)) {
+    const k = config.bonusTarget ? KIND[config.bonusTarget] : reach.sort((a, b) => costs[b.kind] - costs[a.kind])[0];
+    notify(`${s.displayName || slug}: ${s.points} pontos`, `Já dá para resgatar ${k.name} (${costs[k.kind]} pts). Clique para abrir a loja.`, () => openStore(slug));
+  }
+  s.bonusTier = tier;
+}
+
+const dayKey = (t) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+function addDaily(n) {
+  const k = dayKey(Date.now());
+  config.daily[k] = (config.daily[k] || 0) + n;
+  configDirty = true;
+}
+
+function addPurchase(p) {
+  const now = Date.now();
+  config.purchases.push(p);
+  config.purchases = config.purchases.filter((x) => now - x.t < KEEP_PURCHASES_MS);
+  configDirty = true;
+}
+
+// Compra feita fora do app (celular, outro PC): a queda do saldo é explicada pela menor
+// combinação de recompensas de bônus do canal (entre duas leituras o saldo sobe até ~60 pts).
+function matchPurchase(drop, rewards) {
+  const list = rewards.filter((r) => r.available).sort((a, b) => a.hours - b.hours);
+  let best = null;
+  const walk = (start, picked, sum) => {
+    if (sum >= drop && sum <= drop + 60) { if (!best || picked.length < best.length) best = picked; return; }
+    if (picked.length >= 4 || sum > drop + 60) return;
+    for (let i = start; i < list.length; i++) walk(i, [...picked, list[i]], sum + list[i].cost);
+  };
+  walk(0, [], 0);
+  return best || [];
+}
+
+function registerDrop(slug, s, drop) {
+  const known = Math.min(drop, s.pendingSpent || 0);
+  s.pendingSpent = (s.pendingSpent || 0) - known;
+  drop -= known;
+  if (drop < 100) return; // restos de arredondamento ou recompensas baratas que não são bônus
+  const now = Date.now();
+  matchPurchase(drop, s.rewards || []).forEach((r, i) => addPurchase({ t: now + i, kind: r.kind, hours: r.hours, cost: r.cost, slug }));
+}
+
+// Compra feita no app: a loja (ou a live aberta) manda o pedido de resgate para a Twitch, e o
+// app lê o pedido e a resposta. Assim sabe exatamente qual bônus e quantas horas.
+function watchRedemptions(slug, wc) {
+  const dbg = wc.debugger;
+  if (!dbg.isAttached()) { try { dbg.attach('1.3'); } catch { return; } }
+  const pending = new Map();
+  dbg.on('message', async (_e, method, p) => {
+    if (method === 'Network.requestWillBeSent' && p.request.url.startsWith(GQL)) {
+      let body = p.request.postData;
+      if (!body && p.request.hasPostData) body = (await dbg.sendCommand('Network.getRequestPostData', { requestId: p.requestId }).catch(() => ({}))).postData;
+      if (!body || !body.includes('RedeemCustomReward')) return;
+      try {
+        const ops = [].concat(JSON.parse(body));
+        const op = ops.find((o) => o.operationName === 'RedeemCustomReward');
+        const input = op && op.variables && op.variables.input;
+        if (input) pending.set(p.requestId, input);
+      } catch {}
+    } else if (method === 'Network.loadingFinished' && pending.has(p.requestId)) {
+      const input = pending.get(p.requestId);
+      pending.delete(p.requestId);
+      const res = await dbg.sendCommand('Network.getResponseBody', { requestId: p.requestId }).catch(() => null);
+      if (!res) return;
+      let ok = false;
+      try {
+        const r = [].concat(JSON.parse(res.base64Encoded ? Buffer.from(res.body, 'base64').toString() : res.body))
+          .find((x) => x.data && 'redeemCustomReward' in x.data);
+        ok = !!r && !!r.data.redeemCustomReward && !r.data.redeemCustomReward.error;
+      } catch {}
+      if (!ok) return;
+      const s = status.get(slug) || {};
+      s.pendingSpent = (s.pendingSpent || 0) + (Number(input.cost) || 0);
+      const [reward] = parseRewards([{ title: input.title, cost: input.cost, isEnabled: true }]);
+      if (reward) addPurchase({ t: Date.now(), kind: reward.kind, hours: reward.hours, cost: reward.cost, slug });
+      status.set(slug, s);
+      if (configDirty) { configDirty = false; saveConfig(); }
+      send('status', snapshot());
+      updateTray();
+    }
+  });
+  dbg.sendCommand('Network.enable').catch(() => {});
+}
+
+// Fim de cada bônus, somando as horas na ordem das compras.
+function bonusIntervals(purchases = config.purchases) {
+  const byKind = {};
+  for (const p of [...purchases].sort((a, b) => a.t - b.t)) {
+    const list = byKind[p.kind] || (byKind[p.kind] = []);
+    const last = list[list.length - 1];
+    const dur = (p.hours || 1) * BONUS_MS;
+    if (last && last.end >= p.t) last.end += dur;
+    else list.push({ start: p.t, end: p.t + dur });
+  }
+  return byKind;
+}
+
+function activeBonuses(now = Date.now()) {
+  const byKind = bonusIntervals();
+  return KINDS.map((k) => {
+    const cur = (byKind[k.kind] || []).find((i) => i.start <= now && i.end > now);
+    return { kind: k.kind, name: k.name, endsAt: cur ? cur.end : null };
+  });
+}
+
+const warnedEnds = new Set();
+function checkBonusEnding() {
+  const now = Date.now();
+  for (const b of activeBonuses(now)) {
+    if (!b.endsAt || b.endsAt - now > 5 * 60 * 1000 || warnedEnds.has(`${b.kind}:${b.endsAt}`)) continue;
+    warnedEnds.add(`${b.kind}:${b.endsAt}`);
+    if (!config.notifyBonus) continue;
+    const rich = config.channels.map((slug) => [slug, status.get(slug) || {}])
+      .filter(([, s]) => hasBonus(s) && (s.points || 0) >= costsOf(s)[b.kind]).sort((x, y) => y[1].points - x[1].points)[0];
+    notify(`Seu ${b.name} acaba em ${Math.max(1, Math.round((b.endsAt - now) / 60000))} min`,
+      rich ? `${rich[1].displayName || rich[0]} tem ${rich[1].points} pts. Clique para abrir a loja.` : 'Nenhum canal tem pontos para renovar agora.',
+      () => (rich ? openStore(rich[0]) : showMain()));
+  }
+}
+
+// Relatório dos últimos 7 dias.
+const PERIODS = [['Madrugada', 0, 6], ['Dia', 6, 18], ['Noite', 18, 24]];
+function weeklyReport(now = Date.now()) {
+  const from = now - 7 * DAY_MS;
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const t = now - i * DAY_MS, k = dayKey(t);
+    const bought = config.purchases.filter((p) => dayKey(p.t) === k);
+    days.push({ day: k, weekday: new Date(t).toLocaleDateString('pt-BR', { weekday: 'short' }), gained: config.daily[k] || 0,
+      bought: KINDS.map((b) => bought.filter((p) => p.kind === b.kind).reduce((h, p) => h + (p.hours || 1), 0)) });
+  }
+  const all = Object.values(bonusIntervals()).flat();
+  const isOn = (t) => all.some((i) => i.start <= t && i.end > t);
+  const per = PERIODS.map(([name]) => ({ name, on: 0, total: 0 }));
+  let on = 0, total = 0;
+  for (let t = Math.ceil(from / 60000) * 60000; t < now; t += 60000) {
+    const h = new Date(t).getHours();
+    const p = per[PERIODS.findIndex(([, a, b]) => h >= a && h < b)];
+    const active = isOn(t);
+    p.total++; total++;
+    if (active) { p.on++; on++; }
+  }
+  const timeline = [];
+  for (let i = 47; i >= 0; i--) timeline.push(isOn(now - i * 30 * 60000 - 15 * 60000));
+  const recent = config.purchases.filter((p) => p.t >= from);
+  return {
+    days, timeline, timelineStart: now - DAY_MS,
+    gained: days.reduce((t, d) => t + d.gained, 0),
+    bought: KINDS.map((b) => ({ name: b.name, kind: b.kind, count: recent.filter((p) => p.kind === b.kind).reduce((h, p) => h + (p.hours || 1), 0) })),
+    bonusHours: Math.round(on / 60),
+    coverage: total ? Math.round((on / total) * 100) : 0,
+    periods: per.map((p) => ({ name: p.name, pct: p.total ? Math.round((p.on / p.total) * 100) : 0 })),
+    channels: new Set(recent.map((p) => p.slug).filter(Boolean)).size,
+  };
+}
+
+// Lista de parceiros no site: parceiro novo entra para todos sem precisar de versão nova.
+const PARTNERS_URL = 'https://viinnisantoos.github.io/twitchterino/parceiros.json';
+async function syncPartners() {
+  try {
+    const res = await net.fetch(PARTNERS_URL, { cache: 'no-store' });
+    if (!res.ok) return;
+    const list = ((await res.json()).channels || []).map((s) => String(s).toLowerCase()).filter((s) => LOGIN_RE.test(s)).slice(0, 60);
+    const seen = new Set(config.seenDefaults || []);
+    const fresh = list.filter((slug) => !seen.has(slug) && !config.channels.includes(slug));
+    config.seenDefaults = [...new Set([...seen, ...list])];
+    if (fresh.length) { config.channels.push(...fresh); syncChat(); poll(); }
+    saveConfig();
+  } catch {}
+}
+
+// ---------- Consulta dos canais ----------
+const CHANNEL_FIELDS = `id login displayName profileImageURL(width: 70) stream{ id viewersCount title }
+  self{ follower{ followedAt } subscriptionBenefit{ tier } }
+  channel{ self{ communityPoints{ balance availableClaim{ id } } }
+    communityPointsSettings{ isEnabled customRewards{ id title cost isEnabled isPaused isInStock } } }`;
+const SUB_MULT = { 1000: 1.2, 2000: 1.4, 3000: 2 };
+let username = null;
+let chestNotifiedAt = 0;
+
+async function refreshAll() {
+  const slugs = config.channels.filter((s) => LOGIN_RE.test(s));
+  const fresh = [];
+  // A Twitch aceita no máximo 15 consultas por chamada: vai de 10 em 10.
+  for (let i = 0; i < slugs.length; i += 10) {
+    const part = slugs.slice(i, i + 10);
+    const query = `query{ ${i === 0 ? 'currentUser{ login displayName }' : ''} ${part.map((slug, j) => `c${j}: user(login: ${JSON.stringify(slug)}){ ${CHANNEL_FIELDS} }`).join(' ')} }`;
+    let data = null, err = null;
+    try {
+      const { status: code, json } = await gql(query);
+      if (code !== 200 || !json || !json.data) throw new Error(`HTTP ${code}`);
+      data = json.data;
+    } catch (e) { err = String(e.message || e); }
+    if (data && i === 0) username = data.currentUser ? data.currentUser.displayName || data.currentUser.login : null;
+    part.forEach((slug, j) => {
+      const s = status.get(slug) || { watchedMs: 0 };
+      const u = data && data[`c${j}`];
+      if (err) { s.error = err; status.set(slug, s); return; }
+      if (!u) { s.error = 'Canal não encontrado na Twitch'; s.live = false; status.set(slug, s); return; }
+      const wasLive = s.live;
+      s.live = !!u.stream;
+      if (wasLive === false && s.live && config.favorites.includes(slug)) {
+        notify(`★ ${u.displayName} entrou ao vivo`, u.stream.title || 'Clique para abrir o chat.', () => { showMain(); send('select', slug); });
+      }
+      s.displayName = u.displayName || slug;
+      s.avatar = u.profileImageURL || null;
+      s.viewers = u.stream ? u.stream.viewersCount : 0;
+      s.title = u.stream ? u.stream.title : '';
+      s.error = null;
+      s.following = u.self ? !!u.self.follower : null;
+      const tier = u.self && u.self.subscriptionBenefit && u.self.subscriptionBenefit.tier;
+      s.subscribed = !!tier;
+      s.multiplier = SUB_MULT[tier] || 1;
+      const settings = (u.channel && u.channel.communityPointsSettings) || {};
+      s.pointsEnabled = settings.isEnabled !== false;
+      s.rewards = parseRewards(settings.customRewards);
+      // Custo mudou desde a última leitura: avisa (a streamer pode ter mudado o preço).
+      const costs = costsOf(s);
+      if (s.costs && hasBonus(s)) {
+        const changed = KINDS.filter((k) => s.costs[k.kind] !== costs[k.kind]);
+        if (changed.length) s.priceChange = { at: Date.now(), text: changed.map((k) => `${KIND[k.kind].name}: ${s.costs[k.kind]} → ${costs[k.kind]}`).join(' · ') };
+      }
+      s.costs = costs;
+      const cp = u.channel && u.channel.self && u.channel.self.communityPoints;
+      const claim = cp && cp.availableClaim && cp.availableClaim.id;
+      if (claim && claim !== s.claim) fresh.push(slug);
+      s.claim = claim || null;
+      const p = cp ? cp.balance : null;
+      if (typeof p === 'number') {
+        if (s.points != null && p > s.points) {
+          s.gainedTotal = (s.gainedTotal || 0) + (p - s.points);
+          if (watchers.has(slug)) s.lastGainAt = Date.now();
+          addDaily(p - s.points);
+        }
+        if (s.points != null && p < s.points) registerDrop(slug, s, s.points - p);
+        s.points = p;
+        checkBonus(slug, s);
+      }
+      status.set(slug, s);
+    });
+  }
+  // Baú de bônus: com "Pegar baú sozinho" o app clica nele; sem isso, um aviso só para todos os
+  // canais, no máximo a cada 15 min, e a pessoa abre e clica.
+  if (config.autoChest && loggedIn) {
+    for (const slug of config.channels) if ((status.get(slug) || {}).claim) claimChest(slug);
+  } else if (fresh.length && config.notifyChest && Date.now() - chestNotifiedAt > 15 * 60 * 1000) {
+    chestNotifiedAt = Date.now();
+    const names = fresh.map((slug) => (status.get(slug) || {}).displayName || slug);
+    notify(`🎁 Baú de bônus em ${names.slice(0, 3).join(', ')}${names.length > 3 ? '…' : ''}`, 'Clique para abrir o chat e pegar os pontos extras.', () => openStore(fresh[0]));
+  }
+}
+
+// Pega o baú de bônus: abre o chat do canal numa janela escondida, espera o botão do baú
+// aparecer (o mesmo que você clicaria ao lado do saldo), clica uma vez e fecha. Não gasta pontos.
+const claiming = new Set();
+const lastClaimTry = new Map();
+async function claimChest(slug) {
+  if (claiming.has(slug) || Date.now() - (lastClaimTry.get(slug) || 0) < 2 * 60 * 1000) return;
+  claiming.add(slug);
+  lastClaimTry.set(slug, Date.now());
+  const win = new BrowserWindow({
+    width: 400, height: 640, show: false, skipTaskbar: true, focusable: false,
+    webPreferences: { partition: PARTITION, backgroundThrottling: false, spellcheck: false },
+  });
+  win.webContents.setAudioMuted(true);
+  try {
+    await withTimeout(win.loadURL(`${TWITCH}/popout/${slug}/chat?popout=`), 30 * 1000);
+    const ok = await withTimeout(win.webContents.executeJavaScript(`new Promise((done) => {
+      let n = 0;
+      const t = setInterval(() => {
+        const icon = document.querySelector('.claimable-bonus__icon');
+        const btn = icon && icon.closest('button');
+        if (btn) { clearInterval(t); btn.click(); done(true); } else if (++n > 40) { clearInterval(t); done(false); }
+      }, 750);
+    })`), 40 * 1000);
+    if (ok) {
+      await new Promise((r) => setTimeout(r, 3000)); // deixa a Twitch confirmar antes de fechar
+      const s = status.get(slug) || {};
+      s.claim = null;
+      config.chestsClaimed = (config.chestsClaimed || 0) + 1;
+      config.chestDaily = config.chestDaily || {};
+      const k = dayKey(Date.now());
+      config.chestDaily[k] = (config.chestDaily[k] || 0) + 1;
+      configDirty = true;
+      send('toast', `🎁 Baú pego em ${s.displayName || slug}: +50 pts`);
+    }
+  } catch {} finally {
+    if (!win.isDestroyed()) win.destroy();
+    claiming.delete(slug);
+  }
+}
+
+// ---------- Chat (IRC da Twitch, só leitura sem login; envio com a sua conta) ----------
+let irc = null;
+let ircSend = null;
+const ircJoined = new Set();
+
+function parseIrc(line) {
+  let tags = {}, rest = line;
+  if (rest.startsWith('@')) {
+    const sp = rest.indexOf(' ');
+    for (const kv of rest.slice(1, sp).split(';')) { const i = kv.indexOf('='); tags[kv.slice(0, i)] = kv.slice(i + 1).replace(/\\s/g, ' ').replace(/\\:/g, ';').replace(/\\\\/g, '\\'); }
+    rest = rest.slice(sp + 1);
+  }
+  let prefix = '';
+  if (rest.startsWith(':')) { const sp = rest.indexOf(' '); prefix = rest.slice(1, sp); rest = rest.slice(sp + 1); }
+  const ti = rest.indexOf(' :');
+  const trailing = ti >= 0 ? rest.slice(ti + 2) : '';
+  const params = (ti >= 0 ? rest.slice(0, ti) : rest).split(' ');
+  return { tags, prefix, command: params[0], params: params.slice(1), trailing };
+}
+
+// Emotes da Twitch chegam como posições no texto; viram "[emote:id:nome]" para a tela.
+function withEmotes(text, emotesTag) {
+  if (!emotesTag) return text;
+  const chars = Array.from(text);
+  const spots = [];
+  for (const part of emotesTag.split('/')) {
+    const [id, ranges] = part.split(':');
+    for (const r of (ranges || '').split(',')) { const [a, b] = r.split('-').map(Number); if (b >= a) spots.push([a, b, id]); }
+  }
+  spots.sort((x, y) => x[0] - y[0]);
+  let out = '', pos = 0;
+  for (const [a, b, id] of spots) {
+    if (a < pos) continue;
+    out += chars.slice(pos, a).join('') + `[emote:${id}:${chars.slice(a, b + 1).join('')}]`;
+    pos = b + 1;
+  }
+  return out + chars.slice(pos).join('');
+}
+
+const BADGES = { broadcaster: 'Streamer', moderator: 'Mod', vip: 'VIP', subscriber: 'Sub', founder: 'Fundador', staff: 'Staff' };
+function handleIrc(raw) {
+  if (!raw) return;
+  if (raw.startsWith('PING')) { if (irc) irc.send(raw.replace('PING', 'PONG')); return; }
+  const m = parseIrc(raw);
+  if (m.command !== 'PRIVMSG') return;
+  const slug = (m.params[0] || '').replace('#', '');
+  let text = m.trailing;
+  const action = /^\u0001ACTION (.*)\u0001$/.exec(text);
+  if (action) text = action[1];
+  const badges = (m.tags.badges || '').split(',').map((b) => b.split('/')[0]).filter((b) => BADGES[b]).map((type) => ({ type, text: BADGES[type] }));
+  send('chat', { slug, kind: 'message', data: {
+    id: m.tags.id, content: withEmotes(text, m.tags.emotes),
+    created_at: Number(m.tags['tmi-sent-ts']) || Date.now(),
+    sender: { username: m.tags['display-name'] || m.prefix.split('!')[0], identity: { color: m.tags.color || null, badges } },
+    reward: !!m.tags['custom-reward-id'],
+  } });
+}
+
+function connectChat() {
+  if (typeof WebSocket === 'undefined') return;
+  const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+  irc = ws;
+  ws.onopen = () => {
+    ws.send('CAP REQ :twitch.tv/tags twitch.tv/commands');
+    ws.send('PASS SCHMOOPIIE');
+    ws.send(`NICK justinfan${Math.floor(10000 + Math.random() * 80000)}`);
+    ircJoined.clear();
+    syncChat();
+  };
+  ws.onmessage = (e) => String(e.data).split('\r\n').forEach(handleIrc);
+  ws.onclose = () => { if (irc === ws) irc = null; setTimeout(connectChat, 10 * 1000); };
+  ws.onerror = () => {};
+}
+
+function syncChat() {
+  if (!irc || irc.readyState !== 1) return;
+  const want = new Set(config.channels.filter((s) => LOGIN_RE.test(s)));
+  for (const c of want) if (!ircJoined.has(c)) { irc.send(`JOIN #${c}`); ircJoined.add(c); }
+  for (const c of [...ircJoined]) if (!want.has(c)) { irc.send(`PART #${c}`); ircJoined.delete(c); }
+}
+
+// Envio: uma conexão com a sua conta, aberta na primeira mensagem que você manda.
+async function sendChat(slug, content) {
+  const token = await authToken();
+  if (!token || !username) return { ok: false, message: 'faça login na Twitch' };
+  const login = String(username).toLowerCase();
+  if (!ircSend || ircSend.readyState > 1 || ircSend.login !== login) {
+    const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+    ws.login = login;
+    ircSend = ws;
+    ws.ready = new Promise((resolve, reject) => {
+      ws.onopen = () => { ws.send(`PASS oauth:${token}`); ws.send(`NICK ${login}`); };
+      ws.onmessage = (e) => {
+        for (const line of String(e.data).split('\r\n')) {
+          if (line.startsWith('PING')) ws.send(line.replace('PING', 'PONG'));
+          if (/ 001 /.test(line)) resolve();
+          if (/Login authentication failed|Improperly formatted auth/.test(line)) reject(new Error('login recusado pelo chat'));
+        }
+      };
+      ws.onclose = () => reject(new Error('chat fechou'));
+      setTimeout(() => reject(new Error('timeout')), 10 * 1000);
+    });
+  }
+  try {
+    await ircSend.ready;
+    ircSend.send(`PRIVMSG #${slug} :${String(content).replace(/[\r\n]+/g, ' ').slice(0, 500)}`);
+    return { ok: true };
+  } catch (e) {
+    ircSend = null;
+    return { ok: false, message: e.message };
+  }
+}
+
+// ---------- Lives ----------
+// Na janela de cada live: força 160p enquanto ela está oculta.
+function instrumentWatcher(slug, win) {
+  const dbg = win.webContents.debugger;
+  try { dbg.attach('1.3'); } catch { return; }
+  dbg.on('message', async (_e, method, p) => {
+    if (method !== 'Fetch.requestPaused') return;
+    const pass = () => dbg.sendCommand('Fetch.continueRequest', { requestId: p.requestId }).catch(() => {});
+    if (!config.lowQuality || win.isDestroyed() || userOpened.has(win)) return pass();
+    try {
+      const { body, base64Encoded } = await dbg.sendCommand('Fetch.getResponseBody', { requestId: p.requestId });
+      const text = base64Encoded ? Buffer.from(body, 'base64').toString() : body;
+      const low = text.includes('#EXT-X-STREAM-INF') ? lowestQualityOnly(text) : null;
+      if (!low) return pass();
+      await dbg.sendCommand('Fetch.fulfillRequest', {
+        requestId: p.requestId, responseCode: p.responseStatusCode || 200,
+        responseHeaders: p.responseHeaders, body: Buffer.from(low).toString('base64'),
+      });
+    } catch { pass(); }
+  });
+  dbg.sendCommand('Fetch.enable', { patterns: [{ urlPattern: '*.m3u8*', requestStage: 'Response' }] }).catch(() => {});
+  watchRedemptions(slug, win.webContents);
+}
+
+const userOpened = new WeakSet();
+const isLinux = process.platform === 'linux';
+// Janela "invisível": existe para o Windows (o vídeo anda de verdade), mas é transparente, não
+// recebe cliques e não aparece na barra de tarefas nem no Alt+Tab.
+function makeInvisible(win) {
+  userOpened.delete(win);
+  win.setOpacity(0);
+  win.setIgnoreMouseEvents(true);
+  win.setFocusable(false);
+  win.setSize(480, 270);
+  win.setPosition(0, 0);
+  if (isLinux) win.hide();
+  else win.showInactive();
+}
+
+function startWatcher(slug) {
+  if (watchers.has(slug)) return;
+  const win = new BrowserWindow({
+    width: 480, height: 270, x: 0, y: 0, show: false, title: `Twitch — ${slug}`, autoHideMenuBar: true,
+    type: 'toolbar', skipTaskbar: true, focusable: false, opacity: 0,
+    icon: path.join(__dirname, 'build', 'icon.png'),
+    webPreferences: { partition: PARTITION, backgroundThrottling: false, spellcheck: false },
+  });
+  win.webContents.setAudioMuted(true);
+  const wcId = win.webContents.id;
+  watcherIds.add(wcId);
+  win.on('closed', () => watcherIds.delete(wcId));
+  instrumentWatcher(slug, win);
+  win.loadURL(`${TWITCH}/${slug}`);
+  makeInvisible(win);
+  win.on('close', (e) => {
+    if (app.isQuitting || watchers.get(slug) !== win) return;
+    e.preventDefault();
+    makeInvisible(win);
+    win.webContents.setAudioMuted(true);
+    win.webContents.reload();
+  });
+  win.on('closed', () => { if (watchers.get(slug) === win) watchers.delete(slug); });
+  const drop = () => setImmediate(() => { if (watchers.get(slug) === win) stopWatcher(slug); });
+  win.webContents.on('render-process-gone', drop);
+  win.webContents.on('did-fail-load', (_e, code, _desc, _url, isMainFrame) => { if (isMainFrame && code !== -3) drop(); });
+  watchers.set(slug, win);
+  const s = status.get(slug) || {};
+  s.watchingSince = Date.now();
+  status.set(slug, s);
+}
+
+function stopWatcher(slug) {
+  const win = watchers.get(slug);
+  if (!win) return;
+  watchers.delete(slug);
+  const s = status.get(slug);
+  if (s && s.watchingSince) { s.watchedMs = (s.watchedMs || 0) + (Date.now() - s.watchingSince); s.watchingSince = null; }
+  if (!win.isDestroyed()) win.destroy();
+}
+
+// Loja de pontos: o chat popout oficial da Twitch, com o saldo, as recompensas e o baú.
+const storeWindows = new Map();
+function openStore(slug, title = `Pontos — ${slug}`) {
+  let win = storeWindows.get(slug);
+  if (win && !win.isDestroyed()) { win.show(); win.focus(); return; }
+  win = new BrowserWindow({
+    width: 420, height: 760, title, autoHideMenuBar: true, backgroundColor: '#0e0e10',
+    icon: path.join(__dirname, 'build', 'icon.png'),
+    webPreferences: { partition: PARTITION },
+  });
+  watchRedemptions(slug, win.webContents);
+  win.loadURL(`${TWITCH}/popout/${slug}/chat?popout=`);
+  win.on('page-title-updated', (e) => e.preventDefault());
+  win.on('closed', () => {
+    storeWindows.delete(slug);
+    poll();
+    if (storeSequence && storeSequence.current === slug) openNextStore();
+  });
+  storeWindows.set(slug, win);
+}
+
+let storeSequence = null;
+function openNextStore() {
+  const seq = storeSequence;
+  const slug = seq && seq.queue.shift();
+  if (!slug) { storeSequence = null; send('status', snapshot()); return; }
+  seq.current = slug;
+  seq.done++;
+  const name = (status.get(slug) || {}).displayName || slug;
+  openStore(slug, `Pontos — ${name} (${seq.done} de ${seq.total})`);
+  send('status', snapshot());
+}
+
+// Confere cada live oculta: aviso de conteúdo adulto (só a pessoa pode confirmar) e estado do player.
+async function checkPlayers() {
+  for (const [slug, win] of watchers) {
+    const s = status.get(slug);
+    if (!s || win.isDestroyed() || userOpened.has(win)) continue;
+    const info = await withTimeout(win.webContents.executeJavaScript(`(() => {
+      const v = document.querySelector('video');
+      return {
+        gate: !!document.querySelector('[data-a-target="content-classification-gate-overlay-start-watching-button"], [data-a-target="player-overlay-mature-accept"]'),
+        video: v ? { paused: v.paused, time: Math.round(v.currentTime), height: v.videoHeight, ready: v.readyState } : null,
+      };
+    })()`), PLAYER_CHECK_MS).catch((err) => {
+      if (err.message === 'timeout' && watchers.get(slug) === win) stopWatcher(slug);
+      return null;
+    });
+    if (!info) continue;
+    s.ageGate = info.gate;
+    s.video = info.video;
+  }
+}
+
+// "Ganhando": o saldo subiu nos últimos minutos enquanto a live tocava. A Twitch dá 10 pts a
+// cada 5 min assistidos (a primeira contagem vem ~5 min depois que a live abre).
+const EARN_WINDOW_MS = 13 * 60 * 1000;
+function earningState(slug, now) {
+  const s = status.get(slug) || {};
+  if (!watchers.has(slug)) return null;
+  if (s.lastGainAt && now - s.lastGainAt < EARN_WINDOW_MS) return 'earning';
+  if (now - (s.watchingSince || now) < EARN_WINDOW_MS) return 'warming';
+  return 'idle';
+}
+
+function logHistory() {
+  const now = Date.now();
+  const channels = {};
+  for (const slug of config.channels) {
+    const s = status.get(slug) || {};
+    if (!s.live && s.points == null) continue;
+    channels[slug] = {
+      live: !!s.live, watching: watchers.has(slug), points: s.points ?? null, subscribed: !!s.subscribed,
+      earning: earningState(slug, now), video: s.video || null, gate: !!s.ageGate, watchedMin: Math.floor(totalWatched(slug, now) / 60000),
+    };
+  }
+  const line = JSON.stringify({ t: new Date(now).toISOString(), loggedIn, maxWatchers: config.maxWatchers, limitTest: limitTestSnapshot(), channels });
+  const file = path.join(app.getPath('userData'), 'points-log.jsonl');
+  try {
+    if (fs.existsSync(file) && fs.statSync(file).size > 5 * 1024 * 1024) fs.renameSync(file, file + '.old');
+    fs.appendFileSync(file, line + '\n');
+  } catch {}
+}
+
+// Foco em bônus: as vagas vão para quem está mais perto do próximo bônus, com o preço de cada
+// canal. Canal sem recompensa do PokeIdle ainda fica por último. Canal com sub vem primeiro.
+const SWITCH_MARGIN = 50;
+const IDLE_COOLDOWN_MS = 30 * 60 * 1000;
+
+function goalRank(s) {
+  const p = s.points || 0;
+  const costs = costsOf(s);
+  if (config.bonusTarget) {
+    const target = costs[config.bonusTarget];
+    const tier = Math.floor(p / target);
+    const goal = (tier + 1) * target;
+    return { tier, goal, left: goal - p };
+  }
+  const list = [...new Set(Object.values(costs))].sort((a, b) => a - b);
+  const top = list[list.length - 1];
+  if (p >= top) {
+    const m = Math.floor(p / top);
+    return { tier: list.length - 1 + m, goal: (m + 1) * top, left: (m + 1) * top - p };
+  }
+  const tier = list.filter((c) => p >= c).length;
+  return { tier, goal: list[tier], left: list[tier] - p };
+}
+
+const compareGoal = (a, b) => {
+  const ra = goalRank(a), rb = goalRank(b);
+  return !!a.cooling - !!b.cooling || !!b.sub - !!a.sub || !a.bonus - !b.bonus || ra.tier - rb.tier || ra.left - rb.left;
+};
+
+function worthSwitching(candidate, current) {
+  if (candidate.cooling || current.sub) return false;
+  if (candidate.sub) return true;
+  if (candidate.bonus !== current.bonus) return candidate.bonus;
+  const c = goalRank(candidate), w = goalRank(current);
+  return c.tier < w.tier || (c.tier === w.tier && c.left + SWITCH_MARGIN < w.left);
+}
+
+const totalWatched = (slug, now) => {
+  const s = status.get(slug) || {};
+  return (s.watchedMs || 0) + (s.watchingSince ? now - s.watchingSince : 0);
+};
+const turnTime = (slug, now) => now - ((status.get(slug) || {}).watchingSince || now);
+const isShown = (slug) => { const w = watchers.get(slug); return !!w && !w.isDestroyed() && userOpened.has(w); };
+const RECYCLE_MS = 6 * 60 * 60 * 1000;
+
+function reconcileWatchers() {
+  const now = Date.now();
+  const canFarm = config.farming && (loggedIn || process.env.TWITCHTERINO_ALLOW_ANON);
+  for (const slug of [...watchers.keys()]) {
+    const s = status.get(slug);
+    if (isShown(slug)) continue;
+    if (!canFarm || !config.channels.includes(slug) || (s && s.live === false)) stopWatcher(slug);
+  }
+  if (!canFarm) return;
+
+  for (const slug of [...watchers.keys()]) {
+    if (isShown(slug)) continue;
+    const idle = loggedIn && !limitTest && config.maxWatchers <= 2 && earningState(slug, now) === 'idle';
+    const s = status.get(slug);
+    if (idle && s) s.cooldownUntil = now + IDLE_COOLDOWN_MS;
+    if (idle || turnTime(slug, now) >= RECYCLE_MS) stopWatcher(slug);
+  }
+
+  const rotatable = () => [...watchers.keys()].filter((slug) => !isShown(slug)).sort((a, b) => turnTime(b, now) - turnTime(a, now));
+  while (watchers.size > config.maxWatchers && rotatable().length) stopWatcher(rotatable()[0]);
+
+  const focusInfo = (slug) => {
+    const s = status.get(slug) || {};
+    const cooling = (s.cooldownUntil || 0) > now;
+    return { points: s.points, rewards: s.rewards, cooling, sub: !!s.subscribed && !cooling, bonus: hasBonus(s) };
+  };
+  const byGoal = (a, b) => compareGoal(focusInfo(a), focusInfo(b));
+  const waiting = config.channels.filter((slug) => !watchers.has(slug) && (status.get(slug) || {}).live && (status.get(slug) || {}).pointsEnabled !== false);
+  if (config.rotation) waiting.sort(byGoal);
+  while (watchers.size < config.maxWatchers && waiting.length) startWatcher(waiting.shift());
+  if (!config.rotation) return;
+
+  for (const slug of rotatable().sort((a, b) => byGoal(b, a))) {
+    if (!waiting.length || !worthSwitching(focusInfo(waiting[0]), focusInfo(slug))) break;
+    stopWatcher(slug);
+    startWatcher(waiting.shift());
+  }
+}
+
+// Teste de várias lives: mede quantas lives a Twitch conta pontos ao mesmo tempo com a SUA conta.
+// Cada live no ritmo cheio rende 10 pts a cada 5 min, então "lives contando" ≈ pts / (min × 2).
+const LIMIT_LADDER = [2, 3, 4, 6, 8, 10];
+const LIMIT_STEP_MS = (Number(process.env.TWITCHTERINO_LIMIT_STEP_MIN) || 20) * 60 * 1000;
+const LIMIT_WARMUP_MS = (Number(process.env.TWITCHTERINO_LIMIT_WARMUP_MIN) || 7) * 60 * 1000;
+const LIMIT_MAX = 10;
+let limitTest = null;
+
+const sumGained = () => [...status.values()].reduce((t, s) => t + (s.gainedTotal || 0), 0);
+const liveCount = () => config.channels.filter((slug) => (status.get(slug) || {}).live).length;
+
+function startLimitTest() {
+  const all = Math.max(2, Math.min(LIMIT_MAX, liveCount()));
+  limitTest = {
+    i: 0, steps: [all, ...LIMIT_LADDER.filter((n) => n < all)],
+    stepStart: Date.now(), baseline: null, results: [],
+    prev: { maxWatchers: config.maxWatchers, rotation: config.rotation },
+  };
+  config.maxWatchers = all;
+  config.rotation = false;
+}
+
+function stopLimitTest() {
+  if (!limitTest) return;
+  config.maxWatchers = limitTest.prev.maxWatchers;
+  config.rotation = limitTest.prev.rotation;
+  limitTest = null;
+  saveConfig();
+}
+
+function advanceLimitTest() {
+  if (!limitTest) return;
+  const now = Date.now();
+  const elapsed = now - limitTest.stepStart;
+  if (limitTest.baseline == null && elapsed >= LIMIT_WARMUP_MS) { limitTest.baseline = sumGained(); limitTest.baselineAt = now; }
+  if (elapsed < LIMIT_STEP_MS || limitTest.baseline == null) return;
+  const minutes = (now - limitTest.baselineAt) / 60000;
+  const pts = sumGained() - limitTest.baseline;
+  const result = { lives: limitTest.steps[limitTest.i], playing: watchers.size, minutes: Math.round(minutes), pts, counting: Math.round((pts / (minutes * 2)) * 10) / 10 };
+  limitTest.results.push(result);
+  if (limitTest.i === 0) {
+    const cap = result.counting >= result.playing * 0.85 ? 0 : Math.ceil(result.counting) + 2;
+    limitTest.steps = [limitTest.steps[0], ...limitTest.steps.slice(1).filter((n) => n <= Math.max(cap, 3) && cap > 0)];
+  }
+  limitTest.i++;
+  if (limitTest.i < limitTest.steps.length) {
+    Object.assign(limitTest, { stepStart: now, baseline: null });
+    config.maxWatchers = limitTest.steps[limitTest.i];
+    return;
+  }
+  const best = Math.max(...limitTest.results.map((r) => r.pts));
+  const chosen = [...limitTest.results].sort((a, b) => a.lives - b.lives).find((r) => r.pts >= best * 0.9) || limitTest.results[0];
+  config.limitResult = { at: new Date(now).toISOString(), results: limitTest.results, chosen: chosen.lives };
+  config.maxWatchers = chosen.lives;
+  config.rotation = true;
+  limitTest = null;
+  saveConfig();
+}
+
+function limitTestSnapshot() {
+  if (!limitTest) return null;
+  const elapsed = Date.now() - limitTest.stepStart;
+  return {
+    step: limitTest.i + 1, steps: limitTest.steps.length, lives: limitTest.steps[limitTest.i],
+    warming: limitTest.baseline == null, leftMin: Math.max(0, Math.ceil((LIMIT_STEP_MS - elapsed) / 60000)),
+    totalLeftMin: Math.ceil(((limitTest.steps.length - limitTest.i) * LIMIT_STEP_MS - elapsed) / 60000),
+    results: limitTest.results,
+  };
+}
+
+function snapshot() {
+  const now = Date.now();
+  return {
+    farming: config.farming, maxWatchers: config.maxWatchers, lowQuality: config.lowQuality, rotation: config.rotation,
+    bonusTarget: config.bonusTarget, limitTest: limitTestSnapshot(), limitResult: config.limitResult || null,
+    openAtLogin: isOpenAtLogin(), platform: process.platform,
+    notifyBonus: config.notifyBonus, notifyChest: config.notifyChest, autoChest: config.autoChest, chestsToday: (config.chestDaily || {})[dayKey(now)] || 0, notifyChat: config.notifyChat, sleepMode: config.sleepMode,
+    favorites: config.favorites, username, version: app.getVersion(),
+    intro: config.lastSeenVersion === app.getVersion() ? null : (firstRun ? 'welcome' : 'news'),
+    bonuses: activeBonuses(now),
+    today: config.daily[dayKey(now)] || 0,
+    purchases: [...config.purchases].sort((a, b) => b.t - a.t).slice(0, 6),
+    storeSequence: storeSequence ? { done: storeSequence.done, total: storeSequence.total } : null,
+    channels: config.channels.map((slug) => {
+      const s = status.get(slug) || {};
+      const known = s.points != null;
+      const rank = known ? goalRank(s) : null;
+      return {
+        slug, displayName: s.displayName || slug, avatar: s.avatar || null, live: !!s.live, viewers: s.viewers || 0, title: s.title || '',
+        chatroomId: s.displayName ? slug : null, points: s.points ?? null,
+        watching: watchers.has(slug), ageGate: !!s.ageGate, earning: earningState(slug, now),
+        following: s.following ?? null, subscribed: !!s.subscribed, multiplier: s.multiplier || 1,
+        gained: s.gainedTotal || 0, goal: rank ? rank.goal : null, goalLeft: rank ? rank.left : null,
+        costs: costsOf(s), hasBonus: hasBonus(s), rewardsLoaded: !!s.rewards, chest: !!s.claim,
+        rewards: (s.rewards || []).filter((r) => r.available).map((r) => ({ kind: r.kind, hours: r.hours, cost: r.cost })),
+        priceChange: s.priceChange && now - s.priceChange.at < DAY_MS ? s.priceChange.text : null,
+        pointsEnabled: s.pointsEnabled !== false,
+        watchedMin: Math.floor(totalWatched(slug, now) / 60000), error: s.error || null,
+      };
+    }),
+    memoryMB: Math.round(app.getAppMetrics().reduce((t, m) => t + m.memory.workingSetSize, 0) / 1024),
+    loggedIn,
+  };
+}
+
+const POLL_STUCK_MS = 5 * 60 * 1000;
+let polling = false;
+let pollStartedAt = 0;
+let loggedIn = false;
+async function poll() {
+  if (polling && Date.now() - pollStartedAt < POLL_STUCK_MS) return;
+  const startedAt = Date.now();
+  polling = true;
+  pollStartedAt = startedAt;
+  try {
+    loggedIn = !!(await authToken());
+    await withTimeout(apiReady, 5 * 1000);
+    await refreshAll();
+    if (!loggedIn) username = null;
+    if (configDirty) { configDirty = false; saveConfig(); }
+    if (config.channels.length && config.channels.every((slug) => (status.get(slug) || {}).error) && !apiWin.isVisible()) loadApi(LIGHT_URL);
+    advanceLimitTest();
+    reconcileWatchers();
+    await checkPlayers();
+    logHistory();
+    send('status', snapshot());
+    updateTray();
+    if (process.env.TWITCHTERINO_DEBUG) {
+      console.log(JSON.stringify(snapshot()));
+      for (const [slug, win] of watchers) {
+        const h = await win.webContents.executeJavaScript(`(() => { const v = document.querySelector('video'); return v ? v.videoHeight + 'p t=' + Math.round(v.currentTime) + ' paused=' + v.paused : 'sem video'; })()`).catch(() => '?');
+        console.log(`VIDEO ${slug} ${h}`);
+      }
+    }
+  } catch (e) {
+    if (process.env.TWITCHTERINO_DEBUG) console.log("POLL ERROR", e && e.stack);
+    // Twitch ou internet fora do ar: a próxima rodada tenta de novo.
+  } finally { if (pollStartedAt === startedAt) polling = false; }
+}
+
+// ---------- Modo 24/7 ----------
+let awakeBlocker = null;
+function syncKeepAwake() {
+  if (config.farming && awakeBlocker == null) awakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  if (!config.farming && awakeBlocker != null) { powerSaveBlocker.stop(awakeBlocker); awakeBlocker = null; }
+}
+
+function setFarming(on) {
+  config.farming = !!on;
+  saveConfig();
+  syncKeepAwake();
+  reconcileWatchers();
+  updateTray();
+  send('status', snapshot());
+}
+
+const LOGIN_ITEM = { path: process.env.PORTABLE_EXECUTABLE_FILE || process.execPath, args: ['--hidden'] };
+const autostartFile = () => path.join(process.env.XDG_CONFIG_HOME || path.join(app.getPath('home'), '.config'), 'autostart', 'twitchterino.desktop');
+const isOpenAtLogin = () => (isLinux ? fs.existsSync(autostartFile()) : app.getLoginItemSettings(LOGIN_ITEM).openAtLogin);
+function setOpenAtLogin(on) {
+  if (!isLinux) return app.setLoginItemSettings({ ...LOGIN_ITEM, openAtLogin: on });
+  const file = autostartFile();
+  if (!on) return fs.rmSync(file, { force: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const exe = process.env.APPIMAGE || process.execPath;
+  fs.writeFileSync(file, `[Desktop Entry]\nType=Application\nName=Twitchterino\nExec="${exe}" --hidden\nIcon=twitchterino\nX-GNOME-Autostart-enabled=true\n`);
+}
+
+function showMain() {
+  if (!mainWin) return;
+  if (mainWin.isMinimized()) mainWin.restore();
+  mainWin.show();
+  mainWin.focus();
+}
+function quitApp() { app.isQuitting = true; app.quit(); }
+
+let tray = null;
+const clock = (ms) => { const m = Math.max(0, Math.round(ms / 60000)); return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`; };
+function updateTray() {
+  if (!tray) return;
+  const gained = sumGained();
+  const now = Date.now();
+  const active = activeBonuses(now).filter((b) => b.endsAt).map((b) => `${b.name.replace('+15% ', '')} ${clock(b.endsAt - now)}`);
+  tray.setToolTip(`Twitchterino — ${config.farming ? `${watchers.size} assistindo` : 'pausado'}${gained ? ` · +${gained} pts` : ''}`
+    + (active.length ? `\nBônus ativo: ${active.join(' · ')}` : ''));
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Abrir Twitchterino', click: showMain },
+    { label: 'Juntar pontos', type: 'checkbox', checked: config.farming, click: (item) => setFarming(item.checked) },
+    { type: 'separator' },
+    { label: 'Sair', click: quitApp },
+  ]));
+}
+function createTray() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.png')).resize({ width: 16, height: 16 });
+  tray = new Tray(icon);
+  tray.on('click', showMain);
+  updateTray();
+}
+
+function recoverAfterResume() {
+  for (const slug of [...watchers.keys()]) if (!isShown(slug)) stopWatcher(slug);
+  if (!apiWin.isVisible()) loadApi(LIGHT_URL);
+  setTimeout(poll, 15 * 1000);
+}
+
+const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000;
+function setupAutoUpdate() {
+  if (!app.isPackaged || process.env.PORTABLE_EXECUTABLE_FILE || (isLinux && !process.env.APPIMAGE)) return;
+  const check = () => autoUpdater.checkForUpdatesAndNotify().catch(() => {});
+  autoUpdater.on('error', () => {});
+  check();
+  setInterval(check, UPDATE_CHECK_MS);
+}
+
+ipcMain.handle('state:get', () => snapshot());
+ipcMain.handle('channels:add', async (_e, slug) => {
+  slug = String(slug || '').trim().toLowerCase().replace(/^https?:\/\/(www\.)?twitch\.tv\//, '').replace(/[^a-z0-9_]/g, '');
+  if (LOGIN_RE.test(slug) && !config.channels.includes(slug)) { config.channels.push(slug); saveConfig(); syncChat(); poll(); }
+  return snapshot();
+});
+ipcMain.handle('channels:remove', (_e, slug) => {
+  config.channels = config.channels.filter((c) => c !== slug);
+  stopWatcher(slug); status.delete(slug); saveConfig(); syncChat();
+  return snapshot();
+});
+ipcMain.handle('farming:set', (_e, on) => { setFarming(on); return snapshot(); });
+ipcMain.handle('autostart:set', (_e, on) => { try { setOpenAtLogin(!!on); } catch {} return snapshot(); });
+ipcMain.handle('app:quit', quitApp);
+ipcMain.handle('notifyBonus:set', (_e, on) => { config.notifyBonus = !!on; saveConfig(); return snapshot(); });
+ipcMain.handle('notifyChest:set', (_e, on) => { config.notifyChest = !!on; saveConfig(); return snapshot(); });
+ipcMain.handle('autoChest:set', (_e, on) => { config.autoChest = !!on; saveConfig(); if (on) poll(); return snapshot(); });
+ipcMain.handle('notifyChat:set', (_e, on) => { config.notifyChat = !!on; saveConfig(); return snapshot(); });
+ipcMain.handle('sleepMode:set', (_e, on) => { config.sleepMode = !!on; saveConfig(); return snapshot(); });
+ipcMain.handle('favorite:toggle', (_e, slug) => {
+  if (!config.channels.includes(slug)) return snapshot();
+  config.favorites = config.favorites.includes(slug) ? config.favorites.filter((s) => s !== slug) : [...config.favorites, slug];
+  saveConfig();
+  return snapshot();
+});
+ipcMain.handle('purchase:add', (_e, kind) => {
+  if (KIND[kind]) { addPurchase({ t: Date.now(), kind, hours: 1, slug: null }); saveConfig(); configDirty = false; }
+  updateTray();
+  return snapshot();
+});
+ipcMain.handle('purchase:remove', (_e, t) => { config.purchases = config.purchases.filter((p) => p.t !== t); saveConfig(); updateTray(); return snapshot(); });
+ipcMain.handle('stores:sequence', (_e, slugs) => {
+  const queue = (Array.isArray(slugs) ? slugs : []).filter((s) => config.channels.includes(s));
+  if (!queue.length) return snapshot();
+  storeSequence = { queue, total: queue.length, done: 0, current: null };
+  openNextStore();
+  return snapshot();
+});
+ipcMain.handle('stores:cancel', () => { if (storeSequence) storeSequence.queue = []; return snapshot(); });
+ipcMain.handle('report:get', () => weeklyReport());
+ipcMain.handle('report:save', async (_e, rect) => {
+  const r = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
+  const image = await mainWin.webContents.capturePage(r);
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWin, {
+    title: 'Salvar resumo da semana',
+    defaultPath: path.join(app.getPath('pictures'), `twitchterino-semana-${dayKey(Date.now())}.png`),
+    filters: [{ name: 'Imagem PNG', extensions: ['png'] }],
+  });
+  if (canceled || !filePath) return null;
+  fs.writeFileSync(filePath, image.toPNG());
+  return filePath;
+});
+ipcMain.handle('intro:done', () => { config.lastSeenVersion = app.getVersion(); firstRun = false; saveConfig(); return snapshot(); });
+ipcMain.handle('maxWatchers:set', (_e, n) => {
+  limitTest = null;
+  config.maxWatchers = Math.max(1, Math.min(LIMIT_MAX, Number(n) || 1)); saveConfig(); reconcileWatchers(); return snapshot();
+});
+ipcMain.handle('rotation:set', (_e, on) => { limitTest = null; config.rotation = !!on; saveConfig(); reconcileWatchers(); return snapshot(); });
+ipcMain.handle('bonusTarget:set', (_e, kind) => {
+  config.bonusTarget = KIND[kind] ? kind : '';
+  saveConfig();
+  reconcileWatchers();
+  return snapshot();
+});
+ipcMain.handle('limitTest:start', () => {
+  if (!loggedIn) return snapshot();
+  startLimitTest(); reconcileWatchers(); return snapshot();
+});
+ipcMain.handle('limitTest:stop', () => { stopLimitTest(); reconcileWatchers(); return snapshot(); });
+ipcMain.handle('lowQuality:set', (_e, on) => {
+  config.lowQuality = !!on; saveConfig();
+  for (const win of watchers.values()) if (!win.isDestroyed() && !userOpened.has(win)) win.webContents.reload();
+  return snapshot();
+});
+ipcMain.handle('refresh', async () => { await poll(); return snapshot(); });
+ipcMain.handle('login:show', async () => {
+  apiWin.show(); apiWin.focus();
+  await loadApi(`${TWITCH}/login`);
+});
+ipcMain.handle('logout', async () => {
+  const { response } = await dialog.showMessageBox(mainWin, {
+    type: 'question', buttons: ['Sair da conta', 'Cancelar'], defaultId: 1, cancelId: 1,
+    title: 'Sair da conta', message: 'Sair da conta da Twitch neste PC?',
+    detail: 'Os dados de login salvos no app serão apagados. Para juntar pontos de novo, será preciso entrar outra vez.',
+  });
+  if (response !== 0) return snapshot();
+  for (const slug of [...watchers.keys()]) stopWatcher(slug);
+  for (const win of storeWindows.values()) if (!win.isDestroyed()) win.close();
+  if (ircSend) { try { ircSend.close(); } catch {} ircSend = null; }
+  const ses = session.fromPartition(PARTITION);
+  await ses.clearStorageData();
+  await ses.clearCache();
+  await ses.clearAuthCache();
+  ses.flushStorageData();
+  status.clear();
+  username = null;
+  await loadApi(LIGHT_URL);
+  await poll();
+  return snapshot();
+});
+ipcMain.handle('store:open', (_e, slug) => openStore(slug));
+ipcMain.handle('channel:show', (_e, slug) => {
+  let win = watchers.get(slug);
+  if (!win) { startWatcher(slug); win = watchers.get(slug); }
+  userOpened.add(win);
+  win.webContents.setAudioMuted(false);
+  win.setOpacity(1);
+  win.setIgnoreMouseEvents(false);
+  win.setFocusable(true);
+  win.setSize(960, 600); win.center();
+  win.show(); win.focus();
+  win.webContents.reload();
+  const s = status.get(slug);
+  if (s) s.ageGate = false;
+  send('status', snapshot());
+});
+ipcMain.handle('chat:send', (_e, { chatroomId, content }) => sendChat(chatroomId, content));
+
+if (!app.requestSingleInstanceLock()) app.quit();
+app.on('second-instance', showMain);
+app.setAppUserModelId('com.vinniisaantos.twitchterino');
+
+app.whenReady().then(() => {
+  loadConfig();
+  setupSession();
+  mainWin = new BrowserWindow({
+    width: 1380, height: 840, minWidth: 820, minHeight: 560, backgroundColor: '#0b0716', title: 'Twitchterino',
+    show: !process.argv.includes('--hidden'),
+    icon: path.join(__dirname, 'build', 'icon.png'),
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, nodeIntegration: false },
+  });
+  mainWin.setMenuBarVisibility(false);
+  mainWin.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWin.on('close', (e) => {
+    if (app.isQuitting) return;
+    e.preventDefault();
+    mainWin.hide();
+    if (!config.trayHintShown) {
+      config.trayHintShown = true;
+      saveConfig();
+      notify('O Twitchterino continua juntando pontos', 'Ele fica na bandeja, perto do relógio. Para sair de vez: botão direito no ícone > Sair.', showMain);
+    }
+  });
+  mainWin.on('query-session-end', () => { app.isQuitting = true; });
+  mainWin.on('session-end', () => { app.isQuitting = true; });
+
+  createTray();
+  syncKeepAwake();
+  powerMonitor.on('resume', recoverAfterResume);
+  setupAutoUpdate();
+  createApiWindow();
+  connectChat();
+  apiReady.then(poll);
+  setInterval(poll, POLL_MS);
+  setInterval(() => send('status', snapshot()), 15 * 1000);
+  setInterval(() => { checkBonusEnding(); updateTray(); }, 30 * 1000);
+  setTimeout(syncPartners, 30 * 1000);
+  setInterval(syncPartners, 6 * 60 * 60 * 1000);
+});
+
+app.on('before-quit', () => { app.isQuitting = true; });
+app.on('window-all-closed', () => app.quit());
