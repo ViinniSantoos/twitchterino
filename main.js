@@ -1151,6 +1151,7 @@ function resetGainsOnNewDay() {
   if (gainDay && gainDay !== today) for (const s of status.values()) s.gainShown = 0;
   gainDay = today;
 }
+let pollFailures = 0;
 async function poll() {
   if (polling && Date.now() - pollStartedAt < POLL_STUCK_MS) return;
   const startedAt = Date.now();
@@ -1172,6 +1173,7 @@ async function poll() {
     await checkPlayers();
     step('players ok');
     logHistory();
+    pollFailures = 0;
     send('status', snapshot());
     updateTray();
     if (process.env.TWITCHTERINO_DEBUG) {
@@ -1182,8 +1184,12 @@ async function poll() {
       }
     }
   } catch (e) {
-    if (process.env.TWITCHTERINO_DEBUG) console.log("POLL ERROR", e && e.stack);
-    // Twitch ou internet fora do ar: a próxima rodada tenta de novo.
+    if (process.env.TWITCHTERINO_DEBUG) console.log('POLL ERROR', e && e.stack);
+    // Twitch ou internet fora do ar: a próxima rodada tenta de novo. Mas se a página de consulta
+    // morreu sem avisar (PC suspendeu, rede caiu), ela nunca mais responde e toda rodada pararia
+    // aqui: depois de 2 falhas seguidas, recarrega a página.
+    pollFailures++;
+    if (pollFailures >= 2 && apiWin && !apiWin.isDestroyed() && !apiWin.isVisible()) { pollFailures = 0; loadApi(LIGHT_URL); }
   } finally { if (pollStartedAt === startedAt) polling = false; }
 }
 
