@@ -91,6 +91,12 @@ const BLOCKED_HOSTS = [
 ];
 
 const watcherIds = new Set();
+// Lives ocultas só com o player da Twitch (player.twitch.tv): metade da memória da página do
+// canal (~220 MB contra ~440 MB por live) e, medido em 04/11/2026 com conta logada, conta os
+// mesmos pontos (+10 a cada 5 min nas 2 lives) e deixa o baú aparecer. 'page' volta ao jeito antigo.
+const WATCH_MODE = process.env.TWITCHTERINO_WATCH_MODE || 'player';
+// Na live oculta, o chat da página não é usado (o app lê o chat por conta própria).
+const HIDDEN_BLOCK = ['wss://irc-ws.chat.twitch.tv', 'https://irc-ws.chat.twitch.tv'];
 const HIDDEN_SKIP = new Set(['image', 'font']);
 function isHiddenWatcher(webContents) {
   if (!webContents || !watcherIds.has(webContents.id)) return false;
@@ -106,11 +112,14 @@ function setupSession() {
   ses.setUserAgent(app.userAgentFallback);
   ses.setPermissionRequestHandler((_wc, permission, cb) => cb(ALLOWED_PERMISSIONS.has(permission)));
   ses.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, cb) => {
-    cb({ cancel: BLOCKED_HOSTS.some((h) => details.url.includes(h)) || (HIDDEN_SKIP.has(details.resourceType) && isHiddenWatcher(details.webContents)) });
+    const hidden = isHiddenWatcher(details.webContents);
+    cb({ cancel: BLOCKED_HOSTS.some((h) => details.url.includes(h)) || (hidden && (HIDDEN_SKIP.has(details.resourceType) || (WATCH_MODE !== 'page' && HIDDEN_BLOCK.some((h) => details.url.startsWith(h))))) });
   });
   // Login feito: a janela de login some sozinha e o app já começa.
   ses.cookies.on('changed', (_e, cookie, _cause, removed) => {
     if (cookie.name !== 'auth-token' || removed) return;
+    // Grava o login no disco na hora: se o PC desligar ou o app fechar logo depois, ele não se perde.
+    ses.cookies.flushStore().catch(() => {});
     setTimeout(() => {
       if (apiWin && !apiWin.isDestroyed() && apiWin.isVisible()) { apiWin.hide(); loadApi(LIGHT_URL).then(poll); }
     }, 2500);
@@ -820,7 +829,7 @@ function startWatcher(slug) {
   watcherIds.add(wcId);
   win.on('closed', () => watcherIds.delete(wcId));
   instrumentWatcher(slug, win);
-  win.loadURL(`${TWITCH}/${slug}`);
+  win.loadURL(WATCH_MODE === 'player' ? `https://player.twitch.tv/?channel=${slug}&parent=www.twitch.tv&muted=true` : `${TWITCH}/${slug}`);
   makeInvisible(win);
   win.on('close', (e) => {
     if (app.isQuitting || watchers.get(slug) !== win) return;
@@ -980,7 +989,8 @@ const totalWatched = (slug, now) => {
 };
 const turnTime = (slug, now) => now - ((status.get(slug) || {}).watchingSince || now);
 const isShown = (slug) => { const w = watchers.get(slug); return !!w && !w.isDestroyed() && userOpened.has(w); };
-const RECYCLE_MS = 6 * 60 * 60 * 1000;
+// A página da Twitch acumula memória com as horas: a live oculta recarrega a cada 3 h.
+const RECYCLE_MS = 3 * 60 * 60 * 1000;
 
 function reconcileWatchers() {
   const now = Date.now();

@@ -1,6 +1,7 @@
 // Twitchterino — interface (abas estilo Chatterino). O chat chega do processo principal,
 // que lê o chat da Twitch de todos os canais da lista.
-const MAX_MESSAGES = 400;
+const MAX_MESSAGES = 400;       // canal aberto
+const MAX_BACKGROUND = 150;     // canais que você não está olhando (menos memória)
 
 const $ = (sel) => document.querySelector(sel);
 let state = { channels: [], farming: true, maxWatchers: 2 };
@@ -72,7 +73,8 @@ function pushMessage(slug, node) {
   const nodes = node instanceof DocumentFragment ? [...node.childNodes] : [node];
   const buf = buffers.get(slug) || [];
   buf.push(...nodes);
-  while (buf.length > MAX_MESSAGES) { const old = buf.shift(); old.remove(); }
+  const limit = slug === active ? MAX_MESSAGES : MAX_BACKGROUND;
+  while (buf.length > limit) { const old = buf.shift(); old.remove(); }
   buffers.set(slug, buf);
   if (slug === active) {
     const box = $('#messages');
@@ -600,7 +602,7 @@ function showIntro(kind) {
   } else {
     wrap.append(el('h3', null, `Novidades da versão ${state.version} ✨`));
     const ul = el('ul');
-    for (const n of ['🎯 Escolha o pacote em Bônus: XP, Capture Boost ou Secret Lure de 1 h, 3 h, 5 h ou 10 h. O app junta pontos em cada canal até o preço do pacote e avisa quando dá para comprar.', '🌙 O Antes de dormir conta em pacotes (ex.: 4× XP 3 h = 12 h de bônus).', '🎁 Baú de +50 pego um de cada vez, logo depois do login.']) ul.append(el('li', null, n));
+    for (const n of ['🪶 Bem mais leve: as lives ocultas usam só o player da Twitch, com cerca de metade da memória. Os pontos e o baú continuam iguais.', '💾 O login é gravado na hora: não se perde se o PC desligar logo depois de entrar.', '🎯 Escolha o pacote em Bônus: XP, Capture Boost ou Secret Lure de 1 h, 3 h, 5 h ou 10 h.']) ul.append(el('li', null, n));
     wrap.append(ul);
   }
   const actions = el('div', 'modal-actions');
