@@ -606,7 +606,7 @@ function showIntro(kind) {
   } else {
     wrap.append(el('h3', null, `Novidades da versão ${state.version} ✨`));
     const ul = el('ul');
-    for (const n of ["🧹 Painel mais limpo: o \"+X\" de pontos ganhos aparece só nas lives tocando, zera quando você gasta pontos no canal e na virada do dia. Dá para mostrar sempre ou esconder em configurações, e tem o botão \"Zerar +X\".", '🪶 Lives ocultas só com o player da Twitch: cerca de metade da memória.']) ul.append(el('li', null, n));
+    for (const n of ["🛠 Mais estável: se a internet cair ou o PC suspender, o app volta a juntar pontos sozinho (antes podia ficar parado até ser reaberto).", "🧹 Painel mais limpo: o \"+X\" de pontos ganhos aparece só nas lives tocando, zera quando você gasta pontos no canal e na virada do dia. Dá para mostrar sempre ou esconder em configurações, e tem o botão \"Zerar +X\".", '🪶 Lives ocultas só com o player da Twitch: cerca de metade da memória.']) ul.append(el('li', null, n));
     wrap.append(ul);
   }
   const actions = el('div', 'modal-actions');
