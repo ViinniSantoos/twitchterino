@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Twitchterino — pontos da Twitch para o PokeIdle</title>
-  <meta name="description" content="App para Windows que acompanha os canais parceiros do PokeIdle na Twitch: saldo de cada canal com o preço real dos bônus, baú de +50 automático e chat em um só lugar.">
+  <title>Twitchterino — pontos da Twitch para o PokeIdle (Windows e Linux)</title>
+  <meta name="description" content="App para Windows e Linux que acompanha os canais parceiros do PokeIdle na Twitch: saldo de cada canal com o preço real dos bônus, baú de +50 automático e chat em um só lugar.">
   <link rel="icon" href="icon.png">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -28,7 +28,11 @@
         <a class="btn primary" href="https://github.com/ViinniSantoos/twitchterino/releases/latest/download/Twitchterino-Setup.exe">Baixar para Windows</a>
         <a class="btn" href="https://github.com/ViinniSantoos/twitchterino/releases/latest/download/Twitchterino-portatil.exe">Versão portátil</a>
       </div>
-      <p class="note">Grátis e de código aberto · Windows 10 ou 11 · <a href="https://github.com/ViinniSantoos/twitchterino/releases">Todas as versões</a></p>
+      <div class="cta linux">
+        <a class="btn" href="https://github.com/ViinniSantoos/twitchterino/releases/latest/download/Twitchterino-linux.AppImage">🐧 Linux (AppImage)</a>
+        <a class="btn" href="https://github.com/ViinniSantoos/twitchterino/releases/latest/download/Twitchterino-linux.deb">🐧 Linux (.deb)</a>
+      </div>
+      <p class="note">Grátis e de código aberto · Windows 10 ou 11, ou Linux 64 bits · <a href="https://github.com/ViinniSantoos/twitchterino/releases">Todas as versões</a></p>
       <img class="shot" src="app.png" alt="Janela do Twitchterino com a lista de canais com fotos e anéis de progresso, o chat e o painel de bônus" width="1380" height="840">
     </section>
 
@@ -52,6 +56,7 @@
       <ol class="steps">
         <li>Baixe o instalador acima.</li>
         <li>Se o Windows mostrar "O Windows protegeu o computador", clique em <strong>Mais informações</strong> e depois em <strong>Executar assim mesmo</strong>. O aviso aparece porque o app ainda não tem assinatura digital.</li>
+        <li>No Linux, o AppImage precisa de permissão para rodar: clique com o botão direito, abra Propriedades e marque <strong>Permitir executar como programa</strong> (ou rode <code>chmod +x Twitchterino-linux.AppImage</code>). Se ele não abrir, instale o pacote <code>libfuse2</code>. O .deb instala com dois cliques no Ubuntu, Debian e Mint.</li>
         <li>Abra o Twitchterino e clique em <strong>Entrar com a Twitch</strong>. O login é na página da própria Twitch, do jeito que ela oferece: usuário ou e-mail e senha, código de verificação e as outras opções que aparecerem lá.</li>
         <li>Deixe <strong>Juntar pontos</strong> ligado e escolha seu bônus. Pronto.</li>
       </ol>
@@ -77,6 +82,7 @@
       <details><summary>Os preços dos bônus são iguais em todos os canais?</summary><p>Não precisam ser. Cada streamer define o preço na loja do canal, e o app lê esse valor. Os pacotes de 3 h, 5 h e 10 h também aparecem.</p></details>
       <details><summary>Preciso deixar o app aberto na tela?</summary><p>Não. Pode minimizar ou fechar a janela: ele continua na bandeja, perto do relógio. Para sair de vez, clique com o botão direito no ícone e escolha Sair.</p></details>
       <details><summary>Como compro os bônus?</summary><p>Clique no ícone de pontos ao lado do chat para abrir a loja do canal. A compra é sempre feita por você, e o cronômetro começa sozinho.</p></details>
+      <details><summary>Funciona em quais sistemas?</summary><p>Windows 10 ou 11 e Linux 64 bits. No Linux, o AppImage roda sem instalar e se atualiza sozinho; o .deb é para Ubuntu, Debian e Mint e precisa ser baixado de novo a cada versão. Se o ícone da bandeja não aparecer (GNOME sem extensão), use o botão Sair em ⚙ para fechar o app.</p></details>
       <details><summary>O Chatterino ainda funciona para o bônus?</summary><p>Não. Desde a versão 1.400.1 do PokeIdle, o bônus da Twitch é pelos pontos do canal, e a Twitch só dá pontos a quem assiste com o vídeo rodando, como o Twitchterino faz.</p></details>
     </section>
   </main>

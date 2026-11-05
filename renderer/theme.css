@@ -260,3 +260,9 @@ button.group:hover { color: var(--text); background: none; box-shadow: none; }
 .chest-mini.claiming { animation: chest-spin 1s ease-in-out infinite; background: linear-gradient(135deg, #7dffb3, #3ee6ff); }
 .chest-mini.queued { opacity: .75; animation: none; }
 @keyframes chest-spin { 50% { transform: scale(1.08); box-shadow: 0 0 14px rgba(125, 255, 179, .8); } }
+.price-chip.target { border-color: rgba(62, 230, 255, .5); background: rgba(62, 230, 255, .1); }
+.price-chip.target small { color: var(--muted); }
+.price-chip.target.ok small { color: #7dffb3; }
+#bonus-target { max-width: 270px; }
+optgroup { background: #160f2b; color: #d9c8ff; }
+option { background: #160f2b; color: var(--text); }

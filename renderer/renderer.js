@@ -208,6 +208,17 @@ function renderPriceBar(ch) {
   if (!ch.pointsEnabled) { bar.append(el('span', 'price-none', 'Este canal não tem pontos do canal ativos.')); return; }
   if (!ch.hasBonus) { bar.append(el('span', 'price-none', '⏳ Bônus do PokeIdle em breve neste canal: os pontos já contam, mas ainda não há recompensa.')); return; }
   bar.append(el('span', 'price-label', 'Preços aqui:'));
+  // Pacote escolhido em "Bônus" aparece primeiro, com quanto falta neste canal.
+  const [tk, th] = (state.bonusTarget || '').split(':');
+  if (tk) {
+    const hours = Number(th || 1);
+    const chip = el('span', 'price-chip target' + (ch.points != null && ch.points >= ch.targetCost ? ' ok' : ''));
+    const left = ch.points != null ? Math.max(0, ch.targetCost - ch.points) : null;
+    chip.append(el('b', null, `🎯 ${shortName(BONUS_NAMES[tk])}${hours > 1 ? ` ${hours}h` : ''}`), ` ${fmt(ch.targetCost)}`,
+      left != null ? el('small', null, left ? ` · faltam ${fmt(left)}` : ' · já dá!') : '');
+    chip.title = 'Pacote escolhido em Bônus';
+    bar.append(chip);
+  }
   for (const k of KINDS) {
     const list = ch.rewards.filter((r) => r.kind === k).sort((a, b) => a.hours - b.hours);
     if (!list.length) continue;
@@ -362,6 +373,38 @@ function renderWelcome() {
     el('small', null, 'Uma conta por vez. O login fica só neste PC e você pode sair quando quiser.'));
 }
 
+// Lista de "Bônus": automático ou um pacote (tipo + horas) com o preço mais comum nas lojas.
+// Só é refeita quando os pacotes mudam, para não fechar a lista aberta.
+let targetKey = '';
+function renderTargetSelect() {
+  const sel = $('#bonus-target');
+  const opts = state.bonusOptions || [];
+  const key = JSON.stringify(opts.map((o) => [o.value, o.cost, o.channels]));
+  if (key !== targetKey && opts.length) {
+    targetKey = key;
+    const icons = { xp: '⚡', capture: '🎯', lure: '✨' };
+    sel.replaceChildren(el('option', null, 'Bônus automático'));
+    sel.firstChild.value = '';
+    for (const k of KINDS) {
+      const group = document.createElement('optgroup');
+      group.label = `${icons[k]} ${BONUS_NAMES[k]}`;
+      for (const o of opts.filter((x) => x.kind === k)) {
+        const opt = el('option', null, `${shortName(BONUS_NAMES[k])} · ${o.hours} h — ${o.varies ? '~' : ''}${fmt(o.cost)} pts`);
+        opt.value = o.value;
+        if (!o.channels) opt.textContent += ' (nenhum canal)';
+        group.append(opt);
+      }
+      sel.append(group);
+    }
+  }
+  const value = state.bonusTarget && !state.bonusTarget.includes(':') ? `${state.bonusTarget}:1` : (state.bonusTarget || '');
+  sel.value = value;
+  sel.disabled = !state.rotation;
+  const t = opts.find((o) => o.value === value);
+  sel.title = t ? `Juntando pontos em cada canal até ${fmt(t.cost)} para comprar ${BONUS_NAMES[t.kind]} de ${t.hours} h de uma vez.`
+    : 'Automático: todos os canais chegam ao XP, depois Capture Boost e Secret Lure. Ou escolha um pacote (tipo + horas) para juntar até o preço dele.';
+}
+
 function applyState(s) {
   const prevLive = new Map(state.channels.map((c) => [c.slug, c.live]));
   celebrate(state, s);
@@ -375,11 +418,11 @@ function applyState(s) {
   $('#farming').checked = state.farming;
   $('#low-quality').checked = state.lowQuality;
   $('#rotation').checked = state.rotation;
-  $('#bonus-target').value = state.bonusTarget || '';
-  $('#bonus-target').disabled = !state.rotation;
+  renderTargetSelect();
   $('#autostart').checked = !!state.openAtLogin;
   if (state.platform === 'linux') {
-    $('#autostart-label span').textContent = 'Iniciar com o sistema';
+    $('#autostart-label b').textContent = 'Iniciar com o sistema';
+    $('#autostart-label small').textContent = 'Abre sozinho, direto na bandeja, quando você entra no computador.';
     $('#btn-quit').hidden = false;
   }
   $('#notify-bonus').checked = !!state.notifyBonus;
@@ -461,9 +504,11 @@ const button = (text, cls, onclick) => { const b = el('button', cls, text); b.on
 // Antes de dormir: canais com pontos para o bônus escolhido, cada um com o seu preço.
 const sleepPicked = new Set();
 function renderSleepList() {
-  const kind = state.bonusTarget || 'xp';
-  const name = BONUS_NAMES[kind];
-  const costOf = (c) => c.costs[kind];
+  // Com um pacote escolhido, conta pacotes (ex.: 2× XP 3 h); no automático, XP de 1 h.
+  const [kind, h] = (state.bonusTarget || 'xp:1').split(':');
+  const hours = Number(h || 1);
+  const name = `${BONUS_NAMES[kind]}${hours > 1 ? ` (${hours} h)` : ''}`;
+  const costOf = (c) => (state.bonusTarget ? c.targetCost : c.costs[kind]);
   const rich = state.channels.filter((c) => c.hasBonus && (c.points || 0) >= costOf(c)).sort((a, b) => b.points / costOf(b) - a.points / costOf(a));
   for (const s of [...sleepPicked]) if (!rich.some((c) => c.slug === s)) sleepPicked.delete(s);
   const wrap = el('div', 'sleep');
@@ -479,13 +524,13 @@ function renderSleepList() {
     return $('#modal-card').replaceChildren(wrap);
   }
   const total = rich.reduce((t, c) => t + Math.floor(c.points / costOf(c)), 0);
-  wrap.append(el('p', null, `Dá para comprar ${total} h de ${name}, somando os canais. Escolha os canais e as lojas abrem uma de cada vez: você compra e fecha a janela, e a próxima aparece.`));
+  wrap.append(el('p', null, `Dá para comprar ${total}× ${name} (${total * hours} h de bônus), somando os canais. Escolha os canais e as lojas abrem uma de cada vez: você compra e fecha a janela, e a próxima aparece.`));
   const list = el('div', 'sleep-list');
   for (const c of rich) {
     const row = el('label', 'sleep-row');
     const cb = el('input'); cb.type = 'checkbox'; cb.checked = sleepPicked.has(c.slug);
     cb.onchange = () => { if (cb.checked) sleepPicked.add(c.slug); else sleepPicked.delete(c.slug); renderSleepList(); };
-    row.append(cb, el('span', null, c.displayName), el('span', 'sleep-pts', `${fmt(c.points)} pts · ${fmt(costOf(c))}/h · ${Math.floor(c.points / costOf(c))} h`));
+    row.append(cb, el('span', null, c.displayName), el('span', 'sleep-pts', `${fmt(c.points)} pts · ${fmt(costOf(c))} cada · ${Math.floor(c.points / costOf(c))}×`));
     list.append(row);
   }
   wrap.append(list);
@@ -555,7 +600,7 @@ function showIntro(kind) {
   } else {
     wrap.append(el('h3', null, `Novidades da versão ${state.version} ✨`));
     const ul = el('ul');
-    for (const n of ['🎁 Baú de +50 mais rápido: o app pega um de cada vez, logo depois do login, e mostra "pegando…" enquanto trabalha.', '📈 O contador de baús de hoje aparece no topo.']) ul.append(el('li', null, n));
+    for (const n of ['🎯 Escolha o pacote em Bônus: XP, Capture Boost ou Secret Lure de 1 h, 3 h, 5 h ou 10 h. O app junta pontos em cada canal até o preço do pacote e avisa quando dá para comprar.', '🌙 O Antes de dormir conta em pacotes (ex.: 4× XP 3 h = 12 h de bônus).', '🎁 Baú de +50 pego um de cada vez, logo depois do login.']) ul.append(el('li', null, n));
     wrap.append(ul);
   }
   const actions = el('div', 'modal-actions');

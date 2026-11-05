@@ -1,6 +1,6 @@
 # Twitchterino
 
-App para Windows que acompanha os canais parceiros do PokeIdle na Twitch. Ele mostra o saldo de pontos de cada canal com o preço real dos bônus, pega o baú de +50 por você e junta o chat de todos os canais num só lugar.
+App para Windows e Linux que acompanha os canais parceiros do PokeIdle na Twitch. Ele mostra o saldo de pontos de cada canal com o preço real dos bônus, pega o baú de +50 por você e junta o chat de todos os canais num só lugar.
 
 **Download:** https://viinnisantoos.github.io/twitchterino/
 
@@ -33,6 +33,7 @@ npm run dist
 
 - `npm start` roda o app.
 - `npm run dist` gera o instalador e a versão portátil em `dist/`.
+- `npm run dist:linux` (no Linux ou WSL) gera o AppImage e o .deb.
 
 As atualizações automáticas chegam pelo GitHub Releases.
 

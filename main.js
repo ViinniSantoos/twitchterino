@@ -45,7 +45,7 @@ const DEFAULT_CONFIG = {
   maxWatchers: 2,
   lowQuality: true,
   rotation: true,
-  bonusTarget: '', // '' = automático; ou 'xp', 'capture', 'lure'
+  bonusTarget: '', // '' = automático; ou um pacote: 'xp:1', 'xp:3', 'capture:10', 'lure:5'…
   notifyBonus: true,
   autoChest: true,   // baú de bônus da Twitch: o app clica nele sozinho (pode desligar)
   notifyChest: true, // sem o automático: avisa e a pessoa clica
@@ -260,14 +260,56 @@ function notify(title, body, onClick) {
   n.show();
 }
 
+// Pacote escolhido em "Bônus": 'xp:3' = +15% XP de 3 h. Sem escolha, o app vai no automático.
+const HOURS = [1, 3, 5, 10];
+function parseTarget(t = config.bonusTarget) {
+  const m = /^(xp|capture|lure)(?::(\d+))?$/.exec(String(t || ''));
+  return m ? { kind: m[1], hours: Number(m[2] || 1) } : null;
+}
+// Preço do pacote escolhido neste canal: o da loja dele; se o canal não tiver esse pacote,
+// as horas pelo preço de 1 h (é o que a pessoa pagaria comprando de 1 em 1).
+function targetCost(s, target = parseTarget()) {
+  if (!target) return null;
+  const r = (s.rewards || []).find((x) => x.kind === target.kind && x.hours === target.hours && x.available);
+  return r ? r.cost : costsOf(s)[target.kind] * target.hours;
+}
+// Pacotes que existem nas lojas dos canais da lista, com o preço mais comum de cada um.
+function bonusOptions() {
+  const out = [];
+  for (const k of KINDS) for (const hours of HOURS) {
+    const prices = {};
+    let channels = 0;
+    for (const st of status.values()) {
+      const r = (st.rewards || []).find((x) => x.kind === k.kind && x.hours === hours && x.available);
+      if (r) { channels++; prices[r.cost] = (prices[r.cost] || 0) + 1; }
+    }
+    const common = Object.entries(prices).sort((a, b) => b[1] - a[1])[0];
+    out.push({ value: `${k.kind}:${hours}`, kind: k.kind, hours, cost: common ? Number(common[0]) : k.def * hours, channels, varies: Object.keys(prices).length > 1 });
+  }
+  return out;
+}
+const targetName = (target) => `${KIND[target.kind].name}${target.hours > 1 ? ` (${target.hours} h)` : ''}`;
+
 // Avisa quando o saldo alcança um bônus do canal (o saldo ao abrir o app é a referência).
+// Com um pacote escolhido, avisa só quando dá para comprar esse pacote.
 function checkBonus(slug, s) {
+  const target = parseTarget();
+  if (target) {
+    const cost = targetCost(s, target);
+    const n = Math.floor((s.points || 0) / cost);
+    if (s.targetTier != null && n > s.targetTier && config.notifyBonus && hasBonus(s)) {
+      notify(`${s.displayName || slug}: ${s.points} pontos`, `Já dá para resgatar ${targetName(target)} (${cost} pts). Clique para abrir a loja.`, () => openStore(slug));
+    }
+    s.targetTier = n;
+    s.bonusTier = null;
+    return;
+  }
+  s.targetTier = null;
   const costs = costsOf(s);
   const reach = KINDS.filter((k) => s.points >= costs[k.kind]);
   const tier = reach.length;
-  const wanted = !config.bonusTarget || reach.some((k) => k.kind === config.bonusTarget);
-  if (s.bonusTier != null && tier > s.bonusTier && config.notifyBonus && wanted && hasBonus(s)) {
-    const k = config.bonusTarget ? KIND[config.bonusTarget] : reach.sort((a, b) => costs[b.kind] - costs[a.kind])[0];
+  if (s.bonusTier != null && tier > s.bonusTier && config.notifyBonus && hasBonus(s)) {
+    const k = reach.sort((a, b) => costs[b.kind] - costs[a.kind])[0];
     notify(`${s.displayName || slug}: ${s.points} pontos`, `Já dá para resgatar ${k.name} (${costs[k.kind]} pts). Clique para abrir a loja.`, () => openStore(slug));
   }
   s.bonusTier = tier;
@@ -851,10 +893,15 @@ async function checkPlayers() {
         video: v ? { paused: v.paused, time: Math.round(v.currentTime), height: v.videoHeight, ready: v.readyState } : null,
       };
     })()`), PLAYER_CHECK_MS).catch((err) => {
-      if (err.message === 'timeout' && watchers.get(slug) === win) stopWatcher(slug);
+      // Página lenta (PC fraco, Linux sem aceleração) não é página travada: só fecha depois de
+      // 3 checagens seguidas sem resposta e nunca nos primeiros 3 min da live.
+      if (err.message !== 'timeout' || watchers.get(slug) !== win) return null;
+      s.playerTimeouts = (s.playerTimeouts || 0) + 1;
+      if (s.playerTimeouts >= 3 && Date.now() - (s.watchingSince || 0) > 3 * 60 * 1000) { s.playerTimeouts = 0; stopWatcher(slug); }
       return null;
     });
     if (!info) continue;
+    s.playerTimeouts = 0;
     s.ageGate = info.gate;
     s.video = info.video;
   }
@@ -898,8 +945,8 @@ const IDLE_COOLDOWN_MS = 30 * 60 * 1000;
 function goalRank(s) {
   const p = s.points || 0;
   const costs = costsOf(s);
-  if (config.bonusTarget) {
-    const target = costs[config.bonusTarget];
+  if (parseTarget()) {
+    const target = targetCost(s);
     const tier = Math.floor(p / target);
     const goal = (tier + 1) * target;
     return { tier, goal, left: goal - p };
@@ -1048,7 +1095,7 @@ function snapshot() {
   const now = Date.now();
   return {
     farming: config.farming, maxWatchers: config.maxWatchers, lowQuality: config.lowQuality, rotation: config.rotation,
-    bonusTarget: config.bonusTarget, limitTest: limitTestSnapshot(), limitResult: config.limitResult || null,
+    bonusTarget: config.bonusTarget, bonusOptions: bonusOptions(), limitTest: limitTestSnapshot(), limitResult: config.limitResult || null,
     openAtLogin: isOpenAtLogin(), platform: process.platform,
     notifyBonus: config.notifyBonus, notifyChest: config.notifyChest, autoChest: config.autoChest, chestsToday: (config.chestDaily || {})[dayKey(now)] || 0, notifyChat: config.notifyChat, sleepMode: config.sleepMode,
     favorites: config.favorites, username, version: app.getVersion(),
@@ -1067,7 +1114,7 @@ function snapshot() {
         watching: watchers.has(slug), ageGate: !!s.ageGate, earning: earningState(slug, now),
         following: s.following ?? null, subscribed: !!s.subscribed, multiplier: s.multiplier || 1,
         gained: s.gainedTotal || 0, goal: rank ? rank.goal : null, goalLeft: rank ? rank.left : null,
-        costs: costsOf(s), hasBonus: hasBonus(s), rewardsLoaded: !!s.rewards, chest: !!s.claim, chestState: chestBusy === slug ? 'claiming' : chestQueue.includes(slug) ? 'queued' : null,
+        costs: costsOf(s), targetCost: targetCost(s), hasBonus: hasBonus(s), rewardsLoaded: !!s.rewards, chest: !!s.claim, chestState: chestBusy === slug ? 'claiming' : chestQueue.includes(slug) ? 'queued' : null,
         rewards: (s.rewards || []).filter((r) => r.available).map((r) => ({ kind: r.kind, hours: r.hours, cost: r.cost })),
         priceChange: s.priceChange && now - s.priceChange.at < DAY_MS ? s.priceChange.text : null,
         pointsEnabled: s.pointsEnabled !== false,
@@ -1083,6 +1130,7 @@ const POLL_STUCK_MS = 5 * 60 * 1000;
 let polling = false;
 let pollStartedAt = 0;
 let loggedIn = false;
+const step = (...a) => { if (process.env.TWITCHTERINO_DEBUG) console.log('STEP', new Date().toISOString().slice(11, 19), ...a); };
 async function poll() {
   if (polling && Date.now() - pollStartedAt < POLL_STUCK_MS) return;
   const startedAt = Date.now();
@@ -1091,13 +1139,17 @@ async function poll() {
   try {
     loggedIn = !!(await authToken());
     await withTimeout(apiReady, 5 * 1000);
+    step('consulta');
     await refreshAll();
+    step('consulta ok', [...status.values()].filter((s) => s.live).length, 'ao vivo');
     if (!loggedIn) username = null;
     if (configDirty) { configDirty = false; saveConfig(); }
     if (config.channels.length && config.channels.every((slug) => (status.get(slug) || {}).error) && !apiWin.isVisible()) loadApi(LIGHT_URL);
     advanceLimitTest();
     reconcileWatchers();
+    step('lives', watchers.size);
     await checkPlayers();
+    step('players ok');
     logHistory();
     send('status', snapshot());
     updateTray();
@@ -1246,8 +1298,10 @@ ipcMain.handle('maxWatchers:set', (_e, n) => {
   config.maxWatchers = Math.max(1, Math.min(LIMIT_MAX, Number(n) || 1)); saveConfig(); reconcileWatchers(); return snapshot();
 });
 ipcMain.handle('rotation:set', (_e, on) => { limitTest = null; config.rotation = !!on; saveConfig(); reconcileWatchers(); return snapshot(); });
-ipcMain.handle('bonusTarget:set', (_e, kind) => {
-  config.bonusTarget = KIND[kind] ? kind : '';
+ipcMain.handle('bonusTarget:set', (_e, value) => {
+  const t = parseTarget(value);
+  config.bonusTarget = t && HOURS.includes(t.hours) ? `${t.kind}:${t.hours}` : '';
+  for (const st of status.values()) { st.targetTier = null; st.bonusTier = null; } // a referência dos avisos recomeça
   saveConfig();
   reconcileWatchers();
   return snapshot();
@@ -1328,7 +1382,9 @@ app.whenReady().then(() => {
     if (!config.trayHintShown) {
       config.trayHintShown = true;
       saveConfig();
-      notify('O Twitchterino continua juntando pontos', 'Ele fica na bandeja, perto do relógio. Para sair de vez: botão direito no ícone > Sair.', showMain);
+      notify('O Twitchterino continua juntando pontos', isLinux
+        ? 'Ele fica na bandeja do sistema. Se o ícone não aparecer, abra o Twitchterino de novo pelo menu de apps. Para sair de vez, use Fechar o app em ⚙.'
+        : 'Ele fica na bandeja, perto do relógio. Para sair de vez: botão direito no ícone > Sair.', showMain);
     }
   });
   mainWin.on('query-session-end', () => { app.isQuitting = true; });

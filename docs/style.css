@@ -78,3 +78,4 @@ footer p { margin: 0 0 8px; }
   nav { gap: 14px; }
 }
 @media (max-width: 420px) { nav a:first-child { display: none; } }
+.cta.linux { margin-top: 12px; }
