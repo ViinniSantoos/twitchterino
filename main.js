@@ -52,6 +52,7 @@ const DEFAULT_CONFIG = {
   notifyChat: true,
   sleepMode: false,
   favorites: [],
+  gainDisplay: 'watching', // "+X" ao lado do saldo: 'watching' (só nas lives tocando), 'always' ou 'never'
   purchases: [], // { t, kind, hours, slug, cost }
   daily: {},
 };
@@ -550,10 +551,12 @@ async function refreshAll() {
       if (typeof p === 'number') {
         if (s.points != null && p > s.points) {
           s.gainedTotal = (s.gainedTotal || 0) + (p - s.points);
+          s.gainShown = (s.gainShown || 0) + (p - s.points); // o "+X" da tela
           if (watchers.has(slug)) s.lastGainAt = Date.now();
           addDaily(p - s.points);
         }
-        if (s.points != null && p < s.points) registerDrop(slug, s, s.points - p);
+        // Gastou pontos (bônus ou outra recompensa): o "+X" daquele canal recomeça do zero.
+        if (s.points != null && p < s.points) { s.gainShown = 0; registerDrop(slug, s, s.points - p); }
         s.points = p;
         checkBonus(slug, s);
       }
@@ -1111,6 +1114,7 @@ function snapshot() {
     favorites: config.favorites, username, version: app.getVersion(),
     intro: config.lastSeenVersion === app.getVersion() ? null : (firstRun ? 'welcome' : 'news'),
     bonuses: activeBonuses(now),
+    gainDisplay: config.gainDisplay,
     today: config.daily[dayKey(now)] || 0,
     purchases: [...config.purchases].sort((a, b) => b.t - a.t).slice(0, 6),
     storeSequence: storeSequence ? { done: storeSequence.done, total: storeSequence.total } : null,
@@ -1123,7 +1127,7 @@ function snapshot() {
         chatroomId: s.displayName ? slug : null, points: s.points ?? null,
         watching: watchers.has(slug), ageGate: !!s.ageGate, earning: earningState(slug, now),
         following: s.following ?? null, subscribed: !!s.subscribed, multiplier: s.multiplier || 1,
-        gained: s.gainedTotal || 0, goal: rank ? rank.goal : null, goalLeft: rank ? rank.left : null,
+        gained: s.gainShown || 0, goal: rank ? rank.goal : null, goalLeft: rank ? rank.left : null,
         costs: costsOf(s), targetCost: targetCost(s), hasBonus: hasBonus(s), rewardsLoaded: !!s.rewards, chest: !!s.claim, chestState: chestBusy === slug ? 'claiming' : chestQueue.includes(slug) ? 'queued' : null,
         rewards: (s.rewards || []).filter((r) => r.available).map((r) => ({ kind: r.kind, hours: r.hours, cost: r.cost })),
         priceChange: s.priceChange && now - s.priceChange.at < DAY_MS ? s.priceChange.text : null,
@@ -1141,6 +1145,12 @@ let polling = false;
 let pollStartedAt = 0;
 let loggedIn = false;
 const step = (...a) => { if (process.env.TWITCHTERINO_DEBUG) console.log('STEP', new Date().toISOString().slice(11, 19), ...a); };
+let gainDay = null;
+function resetGainsOnNewDay() {
+  const today = new Date().toDateString();
+  if (gainDay && gainDay !== today) for (const s of status.values()) s.gainShown = 0;
+  gainDay = today;
+}
 async function poll() {
   if (polling && Date.now() - pollStartedAt < POLL_STUCK_MS) return;
   const startedAt = Date.now();
@@ -1155,6 +1165,7 @@ async function poll() {
     if (!loggedIn) username = null;
     if (configDirty) { configDirty = false; saveConfig(); }
     if (config.channels.length && config.channels.every((slug) => (status.get(slug) || {}).error) && !apiWin.isVisible()) loadApi(LIGHT_URL);
+    resetGainsOnNewDay();
     advanceLimitTest();
     reconcileWatchers();
     step('lives', watchers.size);
@@ -1251,6 +1262,8 @@ function setupAutoUpdate() {
 }
 
 ipcMain.handle('state:get', () => snapshot());
+ipcMain.handle('gainDisplay:set', (_e, v) => { config.gainDisplay = ['watching', 'always', 'never'].includes(v) ? v : 'watching'; saveConfig(); return snapshot(); });
+ipcMain.handle('gains:reset', () => { for (const s of status.values()) s.gainShown = 0; return snapshot(); });
 ipcMain.handle('channels:add', async (_e, slug) => {
   slug = String(slug || '').trim().toLowerCase().replace(/^https?:\/\/(www\.)?twitch\.tv\//, '').replace(/[^a-z0-9_]/g, '');
   if (LOGIN_RE.test(slug) && !config.channels.includes(slug)) { config.channels.push(slug); saveConfig(); syncChat(); poll(); }

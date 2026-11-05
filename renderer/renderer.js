@@ -314,6 +314,9 @@ function subBadge(mult) {
 }
 
 // ---------- Painel / status ----------
+// "+X" ao lado do saldo: só nas lives tocando (padrão), sempre ou nunca (configurações).
+const showGain = (ch) => state.gainDisplay === 'always' || (state.gainDisplay !== 'never' && ch.watching);
+
 function renderPanel() {
   const rows = $('#panel-rows');
   rows.replaceChildren();
@@ -336,7 +339,7 @@ function renderPanel() {
     const tdStatus = el('td'); tdStatus.append(st);
     if (ch.error) tdStatus.title = ch.error;
     const tdPts = el('td', null, ch.points != null ? fmt(ch.points) : '—');
-    if (ch.gained > 0) tdPts.append(' ', el('span', 'gain', `+${ch.gained}`));
+    if (ch.gained > 0 && showGain(ch)) { const g = el('span', 'gain', `+${ch.gained}`); g.title = 'Pontos ganhos desde a última vez que você gastou pontos neste canal (zera na compra e na virada do dia)'; tdPts.append(' ', g); }
     const eta = etaText(ch);
     if (eta) { const e = el('div', 'eta', eta); e.title = 'Previsão pelo ritmo da Twitch: 10 pts a cada 5 min (mais para subs), sem contar o baú'; tdPts.append(e); }
     const tdName = el('td', null, ch.displayName);
@@ -431,6 +434,7 @@ function applyState(s) {
   $('#notify-chest').checked = !!state.notifyChest;
   $('#auto-chest').checked = !!state.autoChest;
   $('#notify-chat').checked = !!state.notifyChat;
+  $('#gain-display').value = state.gainDisplay || 'watching';
   $('#sleep-mode').checked = !!state.sleepMode;
   if (state.intro && !introShown) { introShown = true; showIntro(state.intro); }
   if (!$('#modal').hidden && modalKind === 'sleep') renderSleepList();
@@ -689,6 +693,8 @@ $('#btn-quit').onclick = () => window.tt.quit();
 $('#notify-chest').onchange = async (e) => applyState(await window.tt.setNotifyChest(e.target.checked));
 $('#auto-chest').onchange = async (e) => applyState(await window.tt.setAutoChest(e.target.checked));
 $('#notify-chat').onchange = async (e) => applyState(await window.tt.setNotifyChat(e.target.checked));
+$('#gain-display').onchange = async (e) => applyState(await window.tt.setGainDisplay(e.target.value));
+$('#btn-reset-gains').onclick = async () => applyState(await window.tt.resetGains());
 $('#sleep-mode').onchange = async (e) => applyState(await window.tt.setSleepMode(e.target.checked));
 $('#btn-sleep').onclick = () => { openModal('sleep'); renderSleepList(); };
 $('#btn-report').onclick = showReport;

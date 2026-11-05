@@ -36,6 +36,8 @@
     <label class="toggle"><input type="checkbox" id="low-quality"> <span><b>Modo leve (160p)</b><small>Lives ocultas sem imagem nem qualidade alta: menos memória e internet.</small></span></label>
     <label class="toggle" id="autostart-label"><input type="checkbox" id="autostart"> <span><b>Iniciar com o Windows</b><small>Abre direto na bandeja, perto do relógio.</small></span></label>
     <label class="toggle"><input type="checkbox" id="auto-chest"> <span><b>Pegar baú sozinho 🎁</b><small>Quando o baú de +50 aparece, o app clica nele por você. Não gasta pontos.</small></span></label>
+    <label class="row" title="O número verde ao lado do saldo, com os pontos ganhos desde a última vez que você gastou pontos no canal">
+      <span><b>Pontos ganhos (+X)</b><small>Zera quando você gasta pontos no canal e na virada do dia.</small></span><select id="gain-display"><option value="watching">Só nas lives tocando</option><option value="always">Em todos os canais</option><option value="never">Não mostrar</option></select></label>
     <h4>Avisos</h4>
     <label class="toggle"><input type="checkbox" id="notify-bonus"> <span><b>Bônus disponível</b><small>Quando um canal alcança o preço de um bônus.</small></span></label>
     <label class="toggle"><input type="checkbox" id="notify-chest"> <span><b>Baú de bônus</b><small>Com "Pegar baú sozinho" desligado: avisa quando o baú aparece para você clicar.</small></span></label>
@@ -91,6 +93,7 @@
           <div id="limit-info"></div>
         </div>
         <div id="tools">
+          <button id="btn-reset-gains" title="Zera os números verdes (+X) de todos os canais">↺ Zerar +X</button>
           <button id="btn-report" title="Pontos, bônus comprados e tempo com bônus ativo nos últimos 7 dias">📊 Relatório da semana</button>
         </div>
         <p class="hint">A Twitch dá 10 pontos a cada 5 min por live assistida (sub ganha mais: ×1,2 no nível 1, ×1,4 no 2 e ×2 no 3). O baú de bônus vale +50 quando você clica nele. O preço dos bônus é lido da loja de cada canal. O app usa uma conta por vez; a Twitch conta no máximo 2 lives por IP como espectador.</p>
