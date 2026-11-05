@@ -606,7 +606,7 @@ function showIntro(kind) {
   } else {
     wrap.append(el('h3', null, `Novidades da versão ${state.version} ✨`));
     const ul = el('ul');
-    for (const n of ['🪶 Bem mais leve: as lives ocultas usam só o player da Twitch, com cerca de metade da memória. Os pontos e o baú continuam iguais.', '💾 O login é gravado na hora: não se perde se o PC desligar logo depois de entrar.', '🎯 Escolha o pacote em Bônus: XP, Capture Boost ou Secret Lure de 1 h, 3 h, 5 h ou 10 h.']) ul.append(el('li', null, n));
+    for (const n of ["🧹 Painel mais limpo: o \"+X\" de pontos ganhos aparece só nas lives tocando, zera quando você gasta pontos no canal e na virada do dia. Dá para mostrar sempre ou esconder em configurações, e tem o botão \"Zerar +X\".", '🪶 Lives ocultas só com o player da Twitch: cerca de metade da memória.']) ul.append(el('li', null, n));
     wrap.append(ul);
   }
   const actions = el('div', 'modal-actions');
